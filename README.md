@@ -25,7 +25,7 @@ Nothing here is tied to one PCB. Buttons, sticks, rumble, LEDs, and the IMU are 
 
 Implemented from the public Wiibrew Wiimote, extension, and MotionPlus notes:
 
-- Sync makes the radio discoverable for 20 seconds (player LEDs blink; how many depends on the battery byte), then it stays connectable so a bonded Wii can reconnect.
+- Sync runs for 20 seconds (player LEDs blink; how many depends on the battery byte). Red-button sync inquires for the console and pages it. The radio also stays connectable and discoverable so a Wii that is scanning (1+2) can connect inbound. After that it stays connectable so a bonded Wii can reconnect. Pairing is legacy PIN only: the host BD_ADDR reversed, 6 bytes. SSP is turned off.
 - Status (`0x20`), memory/register read (`0x21`) and write, ack (`0x22`).
 - Player LEDs, the rumble bit on every output report, and battery level (low-battery flag below `0x20`).
 - Data modes `0x30`–`0x37`, `0x3d`, and interleaved `0x3e`/`0x3f`. Core reports run at 100 Hz after the Wii sends `0x12`. `0x3e`/`0x3f` alternate, so a full IR sample is 50 Hz. Unsolicited extension-change status stops reports until the next `0x12`.
@@ -66,7 +66,7 @@ arduino-cli compile --fqbn esp32:esp32:esp32 examples/BasicButtons
 arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 examples/BasicButtons
 ```
 
-Open the serial monitor at 115200. Put the Wii in sync (red button behind the battery cover, or the system menu's pair screen), then reset the ESP32. The sketch prints `connected` and `disconnected`.
+Open the serial monitor at 115200. Press the red sync button on the Wii, then reset the ESP32. The remote inquires and pages the console, and it also stays discoverable so 1+2 works inbound. Link attempts are `ESP_LOGE` lines (PIN, auth, ACL, L2CAP PSM). The sketch prints `connected` after both HID channels are up.
 
 On Arduino-ESP32 3.x the wrapper includes `esp32-hal-alloc-bt-classic-mem.h` when that header exists, so the core keeps Classic controller memory.
 

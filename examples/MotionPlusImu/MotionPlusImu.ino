@@ -100,7 +100,7 @@ void setup()
         Serial.println("sync failed");
         return;
     }
-    Serial.println("discoverable for 20 seconds");
+    Serial.println("syncing for 20 seconds");
 }
 
 void loop()

@@ -10,6 +10,7 @@
 #include "wiimote_internal.h"
 #include "wiimote_target.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -90,6 +91,9 @@ extern uint8_t SDP_AddUuidSequence(uint32_t handle, uint16_t attr_id, uint16_t n
 extern uint8_t BTM_SetSecurityLevel(uint8_t is_originator, const char *name, uint8_t service_id,
                                     uint16_t sec_level, uint16_t psm, uint32_t proto_id, uint32_t chan_id);
 extern bool btu_task_post(uint32_t sig, void *param, uint32_t timeout);
+/* Legacy security mode. Bluedroid boots in SSP (mode 4); the Wii drops that. */
+extern void btm_sec_init(uint8_t sec_mode);
+extern uint8_t BTM_SecBond(uint8_t *bd_addr, uint8_t pin_len, uint8_t *pin, uint32_t *trusted_mask);
 
 static const char *TAG = "wiimote";
 static wm_l2cap_appl_t s_appl;
@@ -102,6 +106,12 @@ static uint8_t s_cfg_ind_interrupt;
 static uint8_t s_cfg_cfm_interrupt;
 static volatile int s_pump_queued;
 static esp_timer_handle_t s_timer;
+static uint8_t s_syncing;
+static uint8_t s_paging;
+static uint8_t s_inq_limited;
+static uint8_t s_name_pending;
+static uint8_t s_name_bda[6];
+static uint8_t s_page_bda[6];
 static uint8_t s_last_leds;
 static uint8_t s_have_leds;
 static uint8_t s_last_rumble;
@@ -195,6 +205,8 @@ static void on_connect_ind(uint8_t *bda, uint16_t cid, uint16_t psm, uint8_t id)
 {
     uint8_t cfg[512];
     memcpy(s_bda, bda, 6);
+    ESP_LOGE(TAG, "L2CAP PSM 0x%04x cid %u from %02x:%02x:%02x:%02x:%02x:%02x",
+             psm, cid, bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
     if (psm == 0x0011) {
         s_cid_control = cid;
         s_cfg_ind_control = 0;
@@ -256,6 +268,7 @@ static void drop_cid(uint16_t cid)
 
 static void on_disconnect_ind(uint16_t cid, uint8_t ack_needed)
 {
+    ESP_LOGE(TAG, "L2CAP disconnect indication cid %u", cid);
     if (ack_needed) {
         L2CA_DisconnectRsp(cid);
     }
@@ -264,7 +277,7 @@ static void on_disconnect_ind(uint16_t cid, uint8_t ack_needed)
 
 static void on_disconnect_cfm(uint16_t cid, uint16_t result)
 {
-    (void)result;
+    ESP_LOGE(TAG, "L2CAP disconnect confirm cid %u result %u", cid, result);
     drop_cid(cid);
 }
 
@@ -555,17 +568,215 @@ static void timer_cb(void *arg)
     }
 }
 
+static void format_bda(const uint8_t *bda, char *out, size_t n)
+{
+    snprintf(out, n, "%02x:%02x:%02x:%02x:%02x:%02x",
+             bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+}
+
+static int name_is_remote(const char *name)
+{
+    return strncmp(name, "Nintendo RVL-CNT-01", 19) == 0;
+}
+
+static int name_is_console(const char *name)
+{
+    if (name[0] == 0 || name_is_remote(name)) {
+        return 0;
+    }
+    /* Wiibrew names the remote RVL-CNT-01. A console is the other RVL
+     * product, or the short name captured from a console in sync. */
+    return strncmp(name, "Nintendo RVL", 12) == 0 || strcmp(name, "Wii") == 0;
+}
+
+static void start_inquiry(void)
+{
+    esp_bt_inq_mode_t mode;
+    esp_err_t err;
+    if (!s_syncing || s_paging) {
+        return;
+    }
+    mode = s_inq_limited ? ESP_BT_INQ_MODE_LIMITED_INQUIRY : ESP_BT_INQ_MODE_GENERAL_INQUIRY;
+    err = esp_bt_gap_start_discovery(mode, 8, 0);
+    ESP_LOGE(TAG, "inquiry %s: %s", s_inq_limited ? "LIAC" : "GIAC", esp_err_to_name(err));
+}
+
+static void page_on_btu(wm_bt_hdr_t *msg)
+{
+    uint8_t status;
+    free(msg);
+    status = BTM_SecBond(s_page_bda, 0, NULL, NULL);
+    if (status != 0 && status != 1) {
+        ESP_LOGE(TAG, "page failed, BTM_SecBond status %u", status);
+        s_paging = 0;
+        start_inquiry();
+    }
+}
+
+static void page_console(const uint8_t *bda, const char *why)
+{
+    char addr[18];
+    if (s_paging || bda == NULL) {
+        return;
+    }
+    s_paging = 1;
+    memcpy(s_page_bda, bda, 6);
+    format_bda(s_page_bda, addr, sizeof(addr));
+    ESP_LOGE(TAG, "paging Wii %s (%s)", addr, why);
+    esp_bt_gap_cancel_discovery();
+    /* BTM_SecBond runs on the BTU task. It creates the ACL and starts
+     * legacy bonding; the PIN comes back as ESP_BT_GAP_PIN_REQ_EVT. */
+    if (!post_btu(page_on_btu)) {
+        ESP_LOGE(TAG, "page failed, BTU queue full");
+        s_paging = 0;
+        start_inquiry();
+    }
+}
+
+static void copy_name(char *dst, size_t dst_n, const uint8_t *src, int len)
+{
+    size_t n;
+    if (dst_n == 0) {
+        return;
+    }
+    if (src == NULL || len <= 0) {
+        dst[0] = 0;
+        return;
+    }
+    n = (size_t)len;
+    if (n >= dst_n) {
+        n = dst_n - 1;
+    }
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+static void consider_peer(const uint8_t *bda, int have_cod, uint32_t cod, const char *name)
+{
+    char addr[18];
+    uint32_t cls = cod & 0x00ffffffu;
+    format_bda(bda, addr, sizeof(addr));
+    ESP_LOGE(TAG, "inquiry %s cod %s0x%06x name \"%s\"",
+             addr, have_cod ? "" : "?", (unsigned)cls, name ? name : "");
+    if (!s_syncing || s_paging) {
+        return;
+    }
+    /* 0x002504 is RVL-CNT-01, 0x000508 is RVL-CNT-01-TR. Both are remotes. */
+    if (have_cod && (cls == 0x002504u || cls == 0x000508u)) {
+        return;
+    }
+    if (have_cod && cls == 0x000408u) {
+        page_console(bda, "class 0x000408");
+        return;
+    }
+    if (name != NULL && name[0] != 0) {
+        if (name_is_console(name)) {
+            page_console(bda, name);
+        }
+        return;
+    }
+    if (!s_name_pending || memcmp(s_name_bda, bda, 6) != 0) {
+        memcpy(s_name_bda, bda, 6);
+        s_name_pending = 1;
+        esp_bt_gap_read_remote_name((uint8_t *)bda);
+    }
+}
+
+static void on_discovery_result(esp_bt_gap_cb_param_t *param)
+{
+    int have_cod = 0;
+    uint32_t cod = 0;
+    char name[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
+    int i;
+    name[0] = 0;
+    for (i = 0; i < param->disc_res.num_prop; i++) {
+        esp_bt_gap_dev_prop_t *prop = &param->disc_res.prop[i];
+        if (prop->type == ESP_BT_GAP_DEV_PROP_COD && prop->val != NULL && prop->len >= (int)sizeof(uint32_t)) {
+            memcpy(&cod, prop->val, sizeof(cod));
+            have_cod = 1;
+        } else if (prop->type == ESP_BT_GAP_DEV_PROP_BDNAME && prop->val != NULL) {
+            copy_name(name, sizeof(name), prop->val, prop->len);
+        } else if (prop->type == ESP_BT_GAP_DEV_PROP_EIR && prop->val != NULL && name[0] == 0) {
+            uint8_t elen = 0;
+            uint8_t *eir = esp_bt_gap_resolve_eir_data(prop->val, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &elen);
+            if (eir == NULL) {
+                eir = esp_bt_gap_resolve_eir_data(prop->val, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &elen);
+            }
+            copy_name(name, sizeof(name), eir, elen);
+        }
+    }
+    consider_peer(param->disc_res.bda, have_cod, cod, name[0] ? name : NULL);
+}
+
 static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
+    char addr[18];
     if (event == ESP_BT_GAP_PIN_REQ_EVT) {
         esp_bt_pin_code_t pin;
         int i;
+        format_bda(param->pin_req.bda, addr, sizeof(addr));
+        /* Host BD_ADDR, reversed, 6 bytes. Not an ASCII PIN and not SSP. */
         for (i = 0; i < 6; i++) {
             pin[i] = param->pin_req.bda[5 - i];
         }
+        ESP_LOGE(TAG, "PIN request from %s, reply reversed BD_ADDR (6 bytes)", addr);
         esp_bt_gap_pin_reply(param->pin_req.bda, true, 6, pin);
     } else if (event == ESP_BT_GAP_CFM_REQ_EVT) {
-        esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+        format_bda(param->cfm_req.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "SSP confirm from %s rejected", addr);
+        esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, false);
+    } else if (event == ESP_BT_GAP_KEY_REQ_EVT) {
+        format_bda(param->key_req.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "SSP passkey request from %s rejected", addr);
+        esp_bt_gap_ssp_passkey_reply(param->key_req.bda, false, 0);
+    } else if (event == ESP_BT_GAP_KEY_NOTIF_EVT) {
+        format_bda(param->key_notif.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "SSP passkey notification from %s ignored", addr);
+    } else if (event == ESP_BT_GAP_AUTH_CMPL_EVT) {
+        format_bda(param->auth_cmpl.bda, addr, sizeof(addr));
+        if (param->auth_cmpl.stat != ESP_BT_STATUS_SUCCESS) {
+            ESP_LOGE(TAG, "auth fail %s status %d", addr, (int)param->auth_cmpl.stat);
+            if (s_paging) {
+                s_paging = 0;
+                start_inquiry();
+            }
+        } else {
+            ESP_LOGE(TAG, "auth ok %s", addr);
+        }
+    } else if (event == ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT) {
+        format_bda(param->acl_conn_cmpl_stat.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "ACL up %s handle %u status %d", addr,
+                 param->acl_conn_cmpl_stat.handle, (int)param->acl_conn_cmpl_stat.stat);
+        if (param->acl_conn_cmpl_stat.stat != ESP_BT_STATUS_SUCCESS && s_paging) {
+            s_paging = 0;
+            start_inquiry();
+        }
+    } else if (event == ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT) {
+        format_bda(param->acl_disconn_cmpl_stat.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "ACL down %s handle %u reason %d", addr,
+                 param->acl_disconn_cmpl_stat.handle, (int)param->acl_disconn_cmpl_stat.reason);
+        if (s_paging && s_syncing) {
+            s_paging = 0;
+            start_inquiry();
+        }
+    } else if (event == ESP_BT_GAP_DISC_RES_EVT) {
+        on_discovery_result(param);
+    } else if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT) {
+        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED && s_syncing && !s_paging) {
+            s_inq_limited = !s_inq_limited;
+            start_inquiry();
+        }
+    } else if (event == ESP_BT_GAP_READ_REMOTE_NAME_EVT) {
+        s_name_pending = 0;
+        if (param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS) {
+            char name[ESP_BT_GAP_MAX_BDNAME_LEN + 1];
+            copy_name(name, sizeof(name), param->read_rmt_name.rmt_name,
+                      (int)strlen((const char *)param->read_rmt_name.rmt_name));
+            consider_peer(param->read_rmt_name.bda, 0, 0, name);
+        } else {
+            format_bda(param->read_rmt_name.bda, addr, sizeof(addr));
+            ESP_LOGE(TAG, "remote name %s failed status %d", addr, (int)param->read_rmt_name.stat);
+        }
     }
 }
 
@@ -611,6 +822,8 @@ static esp_err_t bring_up_controller(void)
             return err;
         }
     }
+    /* Mode 2 is legacy PIN. Mode 4 (the Bluedroid default) negotiates SSP. */
+    btm_sec_init(2);
     return ESP_OK;
 }
 
@@ -662,16 +875,37 @@ esp_err_t wiimote_bt_start(void)
 
 esp_err_t wiimote_bt_sync(void)
 {
-    return esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    esp_err_t err;
+    /* Inbound 1+2: stay connectable and general-discoverable so a scanning
+     * Wii (or a PC) can open the ACL. Red-button sync is the opposite
+     * direction: the console is discoverable, so inquire LIAC then GIAC
+     * and page the first console. */
+    s_syncing = 1;
+    s_paging = 0;
+    s_name_pending = 0;
+    s_inq_limited = 1;
+    err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    if (err != ESP_OK) {
+        s_syncing = 0;
+        return err;
+    }
+    start_inquiry();
+    return ESP_OK;
 }
 
 void wiimote_bt_listen_only(void)
 {
+    s_syncing = 0;
+    s_paging = 0;
+    esp_bt_gap_cancel_discovery();
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 }
 
 esp_err_t wiimote_bt_stop(void)
 {
+    s_syncing = 0;
+    s_paging = 0;
+    esp_bt_gap_cancel_discovery();
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
     if (!post_btu(stop_cb)) {
         return ESP_FAIL;

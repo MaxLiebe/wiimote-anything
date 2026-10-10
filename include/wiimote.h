@@ -79,7 +79,11 @@ typedef struct {
 void wiimote_pins_init(wiimote_pins_t *pins);
 
 esp_err_t wiimote_init(const wiimote_config_t *config);
-/** Discoverable for 20 seconds, then stay connectable so the Wii can reconnect. */
+/**
+ * For 20 seconds, inquire and page a Wii (red sync button on the console)
+ * while staying connectable and discoverable for an inbound 1+2 connection.
+ * Then stay connectable and stop inquiry.
+ */
 esp_err_t wiimote_sync(void);
 esp_err_t wiimote_stop(void);
 

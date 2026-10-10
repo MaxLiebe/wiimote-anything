@@ -116,7 +116,7 @@ static void wiimote_task(void *arg)
                 s_syncing = false;
                 wiimote_bt_listen_only();
                 wiimote_hw_set_leds(s_leds);
-                ESP_LOGI(TAG, "sync window closed; still connectable");
+                ESP_LOGE(TAG, "sync window closed; still connectable");
             } else if (now - s_blink_us >= 250000) {
                 s_blink_us = now;
                 s_blink_lit = !s_blink_lit;
