@@ -1,0 +1,8 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+*.o
+tests/test_proto
+.cache/
+agent-tools/

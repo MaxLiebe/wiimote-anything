@@ -1,0 +1,4 @@
+version: "1.0.0"
+description: Bluetooth Classic Wiimote peripheral for the original ESP32
+dependencies:
+  idf: ">=4.4"
