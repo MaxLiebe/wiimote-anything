@@ -80,9 +80,9 @@ void wiimote_pins_init(wiimote_pins_t *pins);
 
 esp_err_t wiimote_init(const wiimote_config_t *config);
 /**
- * For 20 seconds, inquire and page a Wii (red sync button on the console)
- * while staying connectable and discoverable for an inbound 1+2 connection.
- * Then stay connectable and stop inquiry.
+ * For 20 seconds, be connectable and limited-discoverable so a Wii that
+ * pressed its red SYNC button can inquire on LIAC and open the ACL.
+ * Then stay connectable and non-discoverable.
  */
 esp_err_t wiimote_sync(void);
 esp_err_t wiimote_stop(void);

@@ -8,10 +8,11 @@
  *   Player LEDs 26, 27, 32, 33 (active high)
  *   Rumble motor transistor on 25
  *
- * Open the serial monitor at 115200. Press the red sync button on the Wii,
- * then reset the ESP32. For 20 seconds the remote inquires and pages the
- * console, and it stays connectable so 1+2 can connect inbound. After that
- * it stays connectable for a bonded Wii. Pairing logs are ESP_LOGE lines.
+ * Open the serial monitor at 115200. Reset the ESP32, then while it is
+ * inside the 20 second window press the red SYNC button on the Wii
+ * console face (not just power). The Wii's player LEDs blink while it
+ * searches. The ESP32 should log an inbound ACL and a PIN request.
+ * After the window it stays connectable and non-discoverable.
  */
 
 #include <Wiimote.h>
