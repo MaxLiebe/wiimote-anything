@@ -229,7 +229,10 @@ void wiimote_hw_init(const wiimote_pins_t *pins)
             if (s_adc != NULL) {
                 adc_oneshot_chan_cfg_t chan = {
                     .bitwidth = ADC_BITWIDTH_12,
-#if defined(ADC_ATTEN_DB_12)
+                    /* 12 dB is the same register value as the old 11 dB name.
+                     * IDF 5.0.0–5.0.4 and 5.1.0–5.1.2 only have ADC_ATTEN_DB_11. */
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 3) || \
+    (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 5) && ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 1, 0))
                     .atten = ADC_ATTEN_DB_12,
 #else
                     .atten = ADC_ATTEN_DB_11,

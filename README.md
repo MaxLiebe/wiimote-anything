@@ -72,13 +72,27 @@ On Arduino-ESP32 3.x the wrapper includes `esp32-hal-alloc-bt-classic-mem.h` whe
 
 ## ESP-IDF component
 
-Point `EXTRA_COMPONENT_DIRS` at this repo (the root `CMakeLists.txt` is the component). Merge `sdkconfig.defaults` into the project:
+Point `EXTRA_COMPONENT_DIRS` at this repo (the root `CMakeLists.txt` is the component). The component name is the directory name of your checkout. `examples/idf` is a tiny project that already does this. From that directory, after sourcing ESP-IDF:
+
+```bash
+idf.py set-target esp32
+idf.py build
+```
+
+That project builds with ESP-IDF 5.4.2 for the original ESP32.
+
+Merge `sdkconfig.defaults` into the project. ESP-IDF 5 does not build Classic L2CAP or SDP unless you ask:
 
 ```
 CONFIG_BT_ENABLED=y
-CONFIG_BT_CLASSIC_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+CONFIG_BT_L2CAP_ENABLED=y
+CONFIG_BT_SDP_COMMON_ENABLED=y
 ```
+
+ESP-IDF 4.4 builds L2CAP and SDP with Classic, so those last two options are not in 4.4. The controller mode should be BR/EDR only or dual mode, not BLE only.
 
 ```c
 #include "wiimote.h"

@@ -618,7 +618,11 @@ esp_err_t wiimote_bt_start(void)
         ESP_LOGE(TAG, "controller init failed: %s", esp_err_to_name(err));
         return err;
     }
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 2)
+    esp_bt_gap_set_device_name("Nintendo RVL-CNT-01");
+#else
     esp_bt_dev_set_device_name("Nintendo RVL-CNT-01");
+#endif
     cod.major = 5;
     cod.minor = 1;
     cod.service = 0x1;
