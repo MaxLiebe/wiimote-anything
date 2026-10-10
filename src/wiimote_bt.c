@@ -88,6 +88,7 @@ extern uint8_t SDP_AddProfileDescriptorList(uint32_t handle, uint16_t profile_uu
 extern uint8_t SDP_AddLanguageBaseAttrIDList(uint32_t handle, uint16_t lang, uint16_t char_enc, uint16_t base_id);
 extern uint8_t SDP_AddServiceClassIdList(uint32_t handle, uint16_t num_services, uint16_t *uuids);
 extern uint8_t SDP_AddUuidSequence(uint32_t handle, uint16_t attr_id, uint16_t num_uuids, uint16_t *uuids);
+extern uint8_t SDP_DeleteRecord(uint32_t handle);
 extern uint8_t BTM_SetSecurityLevel(uint8_t is_originator, const char *name, uint8_t service_id,
                                     uint16_t sec_level, uint16_t psm, uint32_t proto_id, uint32_t chan_id);
 extern void BTM_SetDefaultLinkPolicy(uint16_t settings);
@@ -114,8 +115,12 @@ static uint8_t s_last_rumble;
 static uint8_t s_have_rumble;
 static int s_hid_ready;
 static volatile int s_sync_window;
+/* Set when Bluedroid's 8-attribute record cannot hold the HID descriptor. */
+static int s_own_sdp;
+static uint16_t s_sdp_cid;
 
 static bool post_btu(void (*fn)(wm_bt_hdr_t *));
+static void sdp_on_data(const uint8_t *data, int len);
 
 static void zero_cfg(uint8_t *buf, size_t n)
 {
@@ -205,6 +210,13 @@ static void on_connect_ind(uint8_t *bda, uint16_t cid, uint16_t psm, uint8_t id)
     memcpy(s_bda, bda, 6);
     ESP_LOGE(TAG, "L2CAP PSM 0x%04x cid %u from %02x:%02x:%02x:%02x:%02x:%02x",
              psm, cid, bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+    if (psm == 0x0001) {
+        s_sdp_cid = cid;
+        L2CA_ConnectRsp(bda, id, cid, 0, 0);
+        zero_cfg(cfg, sizeof(cfg));
+        L2CA_ConfigReq(cid, cfg);
+        return;
+    }
     if (psm == 0x0011) {
         s_cid_control = cid;
         s_cfg_ind_control = 0;
@@ -267,6 +279,9 @@ static void drop_cid(uint16_t cid)
 static void on_disconnect_ind(uint16_t cid, uint8_t ack_needed)
 {
     ESP_LOGE(TAG, "L2CAP disconnect indication cid %u", cid);
+    if (cid == s_sdp_cid) {
+        s_sdp_cid = 0;
+    }
     if (ack_needed) {
         L2CA_DisconnectRsp(cid);
     }
@@ -276,6 +291,9 @@ static void on_disconnect_ind(uint16_t cid, uint8_t ack_needed)
 static void on_disconnect_cfm(uint16_t cid, uint16_t result)
 {
     ESP_LOGE(TAG, "L2CAP disconnect confirm cid %u result %u", cid, result);
+    if (cid == s_sdp_cid) {
+        s_sdp_cid = 0;
+    }
     drop_cid(cid);
 }
 
@@ -321,10 +339,17 @@ static void on_data(uint16_t cid, wm_bt_hdr_t *msg)
 {
     uint8_t copy[64];
     size_t n;
-    (void)cid;
     if (msg == NULL) {
         return;
     }
+    if (s_own_sdp && cid == s_sdp_cid) {
+        if (msg->len > 0 && msg->offset + msg->len > msg->offset) {
+            sdp_on_data(msg->data + msg->offset, msg->len);
+        }
+        free(msg);
+        return;
+    }
+    (void)cid;
     n = msg->len;
     if (n > sizeof(copy)) {
         n = sizeof(copy);
@@ -391,11 +416,6 @@ static void add_u16(uint32_t handle, uint16_t attr, uint16_t value)
     note_attr(attr, SDP_AddAttribute(handle, attr, 1, 2, be));
 }
 
-static void add_u8(uint32_t handle, uint16_t attr, uint8_t value)
-{
-    note_attr(attr, SDP_AddAttribute(handle, attr, 1, 1, &value));
-}
-
 static void add_bool(uint32_t handle, uint16_t attr, uint8_t value)
 {
     note_attr(attr, SDP_AddAttribute(handle, attr, 5, 1, &value));
@@ -408,55 +428,707 @@ static void note_attr(uint16_t attr, uint8_t ok)
     }
 }
 
+/* Arduino-ESP32 3.3.12 and 2.0.17 libbt sdp_db.c.obj:
+ * SDP_AddAttribute returns false when num_attributes is already 8,
+ * the value pad is 300 bytes (0x12c), and SDP_MAX_ATTR_LEN is 300.
+ * SDP_CreateRecord mallocs 0x198 bytes and allows 6 records. */
+#define WM_SDP_MAX_REC_ATTR 8
+#define WM_SDP_MAX_ATTR_LEN 300
+#define WM_SDP_MAX_PAD_LEN 300
+#define WM_SDP_MAX_RECORDS 6
+#define WM_SDP_RECORD_BYTES 0x198
+#define WM_SDP_HANDLE 0x00010000u
+
+static int s_slots;
+static int s_pad;
+static uint16_t s_ids[WM_SDP_MAX_REC_ATTR];
+static int s_id_n;
+static int s_got_0202;
+static int s_got_0206;
+static uint8_t s_sdp_body[640];
+static uint8_t s_sdp_wrap[700];
+
+static void remember_id(uint16_t id)
+{
+    if (s_id_n < WM_SDP_MAX_REC_ATTR) {
+        s_ids[s_id_n++] = id;
+    }
+}
+
+static const char *reject_reason(int value_len)
+{
+    if (s_slots >= WM_SDP_MAX_REC_ATTR) {
+        return "too many attributes";
+    }
+    if (value_len > WM_SDP_MAX_ATTR_LEN) {
+        return "longer than SDP_MAX_ATTR_LEN";
+    }
+    /* 3.3.12 SDP_AddAttribute returns false when free_pad is already past
+     * 299, or when free_pad + len is past 300 for a non-text value. */
+    if (s_pad > WM_SDP_MAX_PAD_LEN - 1 || s_pad + value_len > WM_SDP_MAX_PAD_LEN) {
+        return "SDP pad full";
+    }
+    return "bad type or record missing";
+}
+
+static int store_attr(uint32_t handle, uint16_t id, int value_len, uint8_t ok)
+{
+    (void)handle;
+    if (!ok) {
+        ESP_LOGE(TAG, "SDP attr 0x%04x failed: %s (attrs %d, pad %d, value %d)",
+                 id, reject_reason(value_len), s_slots, s_pad, value_len);
+        return 0;
+    }
+    s_slots++;
+    s_pad += value_len;
+    remember_id(id);
+    if (id == 0x0202) {
+        s_got_0202 = 1;
+    }
+    if (id == 0x0206) {
+        s_got_0206 = 1;
+    }
+    return 1;
+}
+
+static void log_stored_ids(void)
+{
+    char line[96];
+    int n = 0;
+    int i;
+    n = snprintf(line, sizeof(line), "SDP stored");
+    for (i = 0; i < s_id_n && n > 0 && n < (int)sizeof(line) - 8; i++) {
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " 0x%04x", s_ids[i]);
+    }
+    ESP_LOGE(TAG, "%s", line);
+}
+
+typedef struct {
+    uint8_t *p;
+    uint8_t *end;
+} wm_w;
+
+static void ww_u8(wm_w *w, uint8_t v)
+{
+    if (w->p < w->end) {
+        *w->p++ = v;
+    }
+}
+
+static void ww_u16(wm_w *w, uint16_t v)
+{
+    ww_u8(w, (uint8_t)(v >> 8));
+    ww_u8(w, (uint8_t)v);
+}
+
+static void ww_bytes(wm_w *w, const uint8_t *b, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        ww_u8(w, b[i]);
+    }
+}
+
+static uint8_t *ww_seq_open(wm_w *w, int wide)
+{
+    uint8_t *lenp;
+    ww_u8(w, (uint8_t)(wide ? 0x36 : 0x35));
+    lenp = w->p;
+    ww_u8(w, 0);
+    if (wide) {
+        ww_u8(w, 0);
+    }
+    return lenp;
+}
+
+static void ww_seq_close(uint8_t *lenp, uint8_t *end, int wide)
+{
+    int n = (int)(end - (lenp + (wide ? 2 : 1)));
+    if (n < 0) {
+        n = 0;
+    }
+    if (wide) {
+        lenp[0] = (uint8_t)(n >> 8);
+        lenp[1] = (uint8_t)n;
+    } else if (lenp < end) {
+        lenp[0] = (uint8_t)n;
+    }
+}
+
+static int de_hdr(const uint8_t *p, int n, int *data_len)
+{
+    int size;
+    int hdr = 1;
+    int d = 0;
+    if (n < 1) {
+        return -1;
+    }
+    size = p[0] & 7;
+    if (size <= 4) {
+        static const int map[5] = {1, 2, 4, 8, 16};
+        d = map[size];
+    } else if (size == 5) {
+        if (n < 2) {
+            return -1;
+        }
+        hdr = 2;
+        d = p[1];
+    } else if (size == 6) {
+        if (n < 3) {
+            return -1;
+        }
+        hdr = 3;
+        d = (p[1] << 8) | p[2];
+    } else {
+        if (n < 5) {
+            return -1;
+        }
+        hdr = 5;
+        d = (p[1] << 24) | (p[2] << 16) | (p[3] << 8) | p[4];
+    }
+    if (d < 0 || hdr + d > n) {
+        return -1;
+    }
+    *data_len = d;
+    return hdr;
+}
+
+static int pattern_has_hid(const uint8_t *p, int n)
+{
+    int i = 0;
+    while (i < n) {
+        int dlen = 0;
+        int hdr = de_hdr(p + i, n - i, &dlen);
+        if (hdr < 0) {
+            return 0;
+        }
+        if (p[i] == 0x19 && dlen == 2 && ((p[i + hdr] << 8) | p[i + hdr + 1]) == 0x1124) {
+            return 1;
+        }
+        if (p[i] == 0x1c && dlen == 16 && p[i + hdr + 2] == 0x11 && p[i + hdr + 3] == 0x24) {
+            return 1;
+        }
+        if ((p[i] >> 3) == 6 && pattern_has_hid(p + i + hdr, dlen)) {
+            return 1;
+        }
+        i += hdr + dlen;
+    }
+    return 0;
+}
+
+static int attr_wanted(const uint8_t *list, int n, uint16_t id)
+{
+    int i = 0;
+    if (list == NULL) {
+        return 1;
+    }
+    while (i < n) {
+        if (list[i] == 0x09 && i + 3 <= n) {
+            uint16_t one = (uint16_t)((list[i + 1] << 8) | list[i + 2]);
+            if (one == id) {
+                return 1;
+            }
+            i += 3;
+        } else if (list[i] == 0x0a && i + 5 <= n) {
+            uint16_t a = (uint16_t)((list[i + 1] << 8) | list[i + 2]);
+            uint16_t b = (uint16_t)((list[i + 3] << 8) | list[i + 4]);
+            if (id >= a && id <= b) {
+                return 1;
+            }
+            i += 5;
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void emit_id(wm_w *w, uint16_t id)
+{
+    ww_u8(w, 0x09);
+    ww_u16(w, id);
+}
+
+static void emit_u8_attr(wm_w *w, const uint8_t *filter, int flen, uint16_t id, uint8_t v)
+{
+    if (!attr_wanted(filter, flen, id)) {
+        return;
+    }
+    emit_id(w, id);
+    ww_u8(w, 0x08);
+    ww_u8(w, v);
+}
+
+static void emit_u16_attr(wm_w *w, const uint8_t *filter, int flen, uint16_t id, uint16_t v)
+{
+    if (!attr_wanted(filter, flen, id)) {
+        return;
+    }
+    emit_id(w, id);
+    ww_u8(w, 0x09);
+    ww_u16(w, v);
+}
+
+static void emit_bool_attr(wm_w *w, const uint8_t *filter, int flen, uint16_t id, uint8_t v)
+{
+    if (!attr_wanted(filter, flen, id)) {
+        return;
+    }
+    emit_id(w, id);
+    ww_u8(w, 0x28);
+    ww_u8(w, v);
+}
+
+static void emit_text_attr(wm_w *w, const uint8_t *filter, int flen, uint16_t id, const char *s)
+{
+    int n = (int)strlen(s);
+    if (!attr_wanted(filter, flen, id)) {
+        return;
+    }
+    emit_id(w, id);
+    ww_u8(w, 0x25);
+    ww_u8(w, (uint8_t)n);
+    ww_bytes(w, (const uint8_t *)s, n);
+}
+
+static void emit_proto_pair(wm_w *w, uint16_t psm)
+{
+    ww_u8(w, 0x35);
+    ww_u8(w, 0x06);
+    ww_u8(w, 0x19);
+    ww_u16(w, 0x0100);
+    ww_u8(w, 0x09);
+    ww_u16(w, psm);
+    ww_u8(w, 0x35);
+    ww_u8(w, 0x03);
+    ww_u8(w, 0x19);
+    ww_u16(w, 0x0011);
+}
+
+static int build_attr_body(uint8_t *dst, int cap, const uint8_t *filter, int flen)
+{
+    wm_w w;
+    uint8_t *seq;
+    uint8_t *start;
+    w.p = dst;
+    w.end = dst + cap;
+    if (attr_wanted(filter, flen, 0x0000)) {
+        emit_id(&w, 0x0000);
+        ww_u8(&w, 0x0a);
+        ww_u8(&w, 0x00);
+        ww_u8(&w, 0x01);
+        ww_u8(&w, 0x00);
+        ww_u8(&w, 0x00);
+    }
+    if (attr_wanted(filter, flen, 0x0001)) {
+        emit_id(&w, 0x0001);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x03);
+        ww_u8(&w, 0x19);
+        ww_u16(&w, 0x1124);
+    }
+    if (attr_wanted(filter, flen, 0x0004)) {
+        emit_id(&w, 0x0004);
+        seq = ww_seq_open(&w, 0);
+        start = w.p;
+        emit_proto_pair(&w, 0x0011);
+        ww_seq_close(seq, w.p, 0);
+        (void)start;
+    }
+    if (attr_wanted(filter, flen, 0x0005)) {
+        emit_id(&w, 0x0005);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x03);
+        ww_u8(&w, 0x19);
+        ww_u16(&w, 0x1002);
+    }
+    if (attr_wanted(filter, flen, 0x0006)) {
+        emit_id(&w, 0x0006);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x09);
+        ww_u8(&w, 0x09);
+        ww_u16(&w, 0x656e);
+        ww_u8(&w, 0x09);
+        ww_u16(&w, 0x006a);
+        ww_u8(&w, 0x09);
+        ww_u16(&w, 0x0100);
+    }
+    if (attr_wanted(filter, flen, 0x0009)) {
+        emit_id(&w, 0x0009);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x08);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x06);
+        ww_u8(&w, 0x19);
+        ww_u16(&w, 0x1124);
+        ww_u8(&w, 0x09);
+        ww_u16(&w, 0x0100);
+    }
+    if (attr_wanted(filter, flen, 0x000d)) {
+        emit_id(&w, 0x000d);
+        seq = ww_seq_open(&w, 0);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x0d);
+        emit_proto_pair(&w, 0x0013);
+        ww_seq_close(seq, w.p, 0);
+    }
+    emit_text_attr(&w, filter, flen, 0x0100, "Nintendo RVL-CNT-01");
+    emit_text_attr(&w, filter, flen, 0x0101, "Nintendo RVL-CNT-01");
+    emit_text_attr(&w, filter, flen, 0x0102, "Nintendo");
+    emit_u16_attr(&w, filter, flen, 0x0200, 0x0100);
+    emit_u16_attr(&w, filter, flen, 0x0201, 0x0111);
+    emit_u8_attr(&w, filter, flen, 0x0202, 0x04);
+    emit_u8_attr(&w, filter, flen, 0x0203, 0x33);
+    emit_bool_attr(&w, filter, flen, 0x0204, 0);
+    emit_bool_attr(&w, filter, flen, 0x0205, 1);
+    if (attr_wanted(filter, flen, 0x0206)) {
+        uint8_t *outer;
+        uint8_t *inner;
+        emit_id(&w, 0x0206);
+        outer = ww_seq_open(&w, 0);
+        inner = ww_seq_open(&w, 0);
+        ww_u8(&w, 0x08);
+        ww_u8(&w, 0x22);
+        ww_u8(&w, 0x25);
+        ww_u8(&w, (uint8_t)sizeof(s_rvl_hid_report));
+        ww_bytes(&w, s_rvl_hid_report, (int)sizeof(s_rvl_hid_report));
+        ww_seq_close(inner, w.p, 0);
+        ww_seq_close(outer, w.p, 0);
+    }
+    if (attr_wanted(filter, flen, 0x0207)) {
+        emit_id(&w, 0x0207);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x08);
+        ww_u8(&w, 0x35);
+        ww_u8(&w, 0x06);
+        ww_u8(&w, 0x09);
+        ww_u16(&w, 0x0409);
+        ww_u8(&w, 0x09);
+        ww_u16(&w, 0x0100);
+    }
+    emit_bool_attr(&w, filter, flen, 0x0208, 0);
+    emit_bool_attr(&w, filter, flen, 0x0209, 1);
+    emit_bool_attr(&w, filter, flen, 0x020a, 1);
+    emit_u16_attr(&w, filter, flen, 0x020b, 0x0100);
+    emit_u16_attr(&w, filter, flen, 0x020c, 0x0c80);
+    emit_bool_attr(&w, filter, flen, 0x020d, 0);
+    emit_bool_attr(&w, filter, flen, 0x020e, 0);
+    if (w.p == w.end) {
+        return -1;
+    }
+    return (int)(w.p - dst);
+}
+
+static int wrap_attrs(uint8_t *dst, int cap, const uint8_t *body, int blen, int records)
+{
+    wm_w w;
+    uint8_t *outer = NULL;
+    uint8_t *inner;
+    int wide = blen > 255;
+    w.p = dst;
+    w.end = dst + cap;
+    if (records) {
+        int inner_total = (wide ? 3 : 2) + blen;
+        outer = ww_seq_open(&w, inner_total > 255);
+    }
+    inner = ww_seq_open(&w, wide);
+    ww_bytes(&w, body, blen);
+    ww_seq_close(inner, w.p, wide);
+    if (records && outer != NULL) {
+        ww_seq_close(outer, w.p, ((wide ? 3 : 2) + blen) > 255);
+    }
+    if (w.p == w.end) {
+        return -1;
+    }
+    return (int)(w.p - dst);
+}
+
+static void sdp_error(uint16_t tid, uint16_t code)
+{
+    uint8_t p[7];
+    p[0] = 0x01;
+    p[1] = (uint8_t)(tid >> 8);
+    p[2] = (uint8_t)tid;
+    p[3] = 0x00;
+    p[4] = 0x02;
+    p[5] = (uint8_t)(code >> 8);
+    p[6] = (uint8_t)code;
+    send_packet(s_sdp_cid, p, 7);
+}
+
+static void sdp_send_list(uint8_t pdu, uint16_t tid, const uint8_t *blob, int blob_len,
+                          uint16_t max_count, uint16_t offset)
+{
+    uint8_t pkt[640];
+    int chunk;
+    int cont;
+    int n;
+    if (offset > (uint16_t)blob_len) {
+        offset = (uint16_t)blob_len;
+    }
+    chunk = blob_len - offset;
+    if (max_count == 0) {
+        max_count = 1;
+    }
+    if (chunk > (int)max_count) {
+        chunk = (int)max_count;
+    }
+    cont = (offset + chunk < blob_len) ? 2 : 0;
+    if (7 + chunk + 1 + cont > (int)sizeof(pkt)) {
+        chunk = (int)sizeof(pkt) - 8 - cont;
+        if (chunk < 0) {
+            chunk = 0;
+        }
+        cont = (offset + chunk < blob_len) ? 2 : 0;
+    }
+    pkt[0] = pdu;
+    pkt[1] = (uint8_t)(tid >> 8);
+    pkt[2] = (uint8_t)tid;
+    n = 2 + chunk + 1 + cont;
+    pkt[3] = (uint8_t)(n >> 8);
+    pkt[4] = (uint8_t)n;
+    pkt[5] = (uint8_t)(chunk >> 8);
+    pkt[6] = (uint8_t)chunk;
+    if (chunk > 0) {
+        memcpy(pkt + 7, blob + offset, (size_t)chunk);
+    }
+    pkt[7 + chunk] = (uint8_t)cont;
+    if (cont) {
+        uint16_t next = (uint16_t)(offset + chunk);
+        pkt[8 + chunk] = (uint8_t)(next >> 8);
+        pkt[9 + chunk] = (uint8_t)next;
+    }
+    send_packet(s_sdp_cid, pkt, 7 + chunk + 1 + cont);
+}
+
+static int sdp_continuation(const uint8_t *p, int n, int used, uint16_t *offset)
+{
+    int clen;
+    if (used >= n) {
+        return -1;
+    }
+    clen = p[used];
+    if (clen == 0) {
+        *offset = 0;
+        return 0;
+    }
+    if (clen == 2 && used + 3 <= n) {
+        *offset = (uint16_t)((p[used + 1] << 8) | p[used + 2]);
+        return 0;
+    }
+    return -1;
+}
+
+static void sdp_on_data(const uint8_t *p, int len)
+{
+    uint8_t pdu;
+    uint16_t tid;
+    uint16_t plen;
+    uint16_t maxc;
+    uint16_t offset = 0;
+    const uint8_t *par;
+    const uint8_t *filter = NULL;
+    int flen = 0;
+    int hdr;
+    int dlen = 0;
+    int used;
+    int blen;
+    int wlen;
+    int match;
+    if (len < 5) {
+        return;
+    }
+    pdu = p[0];
+    tid = (uint16_t)((p[1] << 8) | p[2]);
+    plen = (uint16_t)((p[3] << 8) | p[4]);
+    if ((int)plen > len - 5) {
+        plen = (uint16_t)(len - 5);
+    }
+    par = p + 5;
+    ESP_LOGE(TAG, "SDP pdu 0x%02x tid %u plen %u", pdu, tid, plen);
+    if (pdu == 0x02) {
+        uint8_t rsp[14];
+        hdr = de_hdr(par, plen, &dlen);
+        match = (hdr > 0) && pattern_has_hid(par + hdr, dlen);
+        ESP_LOGE(TAG, "SDP service search hid %d", match);
+        rsp[0] = 0x03;
+        rsp[1] = (uint8_t)(tid >> 8);
+        rsp[2] = (uint8_t)tid;
+        if (!match) {
+            rsp[3] = 0;
+            rsp[4] = 5;
+            memset(rsp + 5, 0, 5);
+            send_packet(s_sdp_cid, rsp, 10);
+            return;
+        }
+        rsp[3] = 0;
+        rsp[4] = 9;
+        rsp[5] = 0;
+        rsp[6] = 1;
+        rsp[7] = 0;
+        rsp[8] = 1;
+        rsp[9] = 0x00;
+        rsp[10] = 0x01;
+        rsp[11] = 0x00;
+        rsp[12] = 0x00;
+        rsp[13] = 0;
+        send_packet(s_sdp_cid, rsp, 14);
+        return;
+    }
+    if (pdu != 0x04 && pdu != 0x06) {
+        sdp_error(tid, 0x0003);
+        return;
+    }
+    used = 0;
+    if (pdu == 0x04) {
+        uint32_t handle;
+        if (plen < 6) {
+            sdp_error(tid, 0x0003);
+            return;
+        }
+        handle = ((uint32_t)par[0] << 24) | ((uint32_t)par[1] << 16) | ((uint32_t)par[2] << 8) | par[3];
+        if (handle != WM_SDP_HANDLE) {
+            sdp_error(tid, 0x0002);
+            return;
+        }
+        maxc = (uint16_t)((par[4] << 8) | par[5]);
+        used = 6;
+        match = 1;
+    } else {
+        hdr = de_hdr(par, plen, &dlen);
+        if (hdr < 0) {
+            sdp_error(tid, 0x0003);
+            return;
+        }
+        match = pattern_has_hid(par + hdr, dlen);
+        used = hdr + dlen;
+        if (used + 2 > plen) {
+            sdp_error(tid, 0x0003);
+            return;
+        }
+        maxc = (uint16_t)((par[used] << 8) | par[used + 1]);
+        used += 2;
+        ESP_LOGE(TAG, "SDP search attribute hid %d max %u", match, maxc);
+    }
+    hdr = de_hdr(par + used, plen - used, &dlen);
+    if (hdr < 0) {
+        sdp_error(tid, 0x0003);
+        return;
+    }
+    filter = par + used + hdr;
+    flen = dlen;
+    used += hdr + dlen;
+    if (sdp_continuation(par, plen, used, &offset) != 0) {
+        sdp_error(tid, 0x0005);
+        return;
+    }
+    if (!match) {
+        uint8_t empty[2] = {0x35, 0x00};
+        sdp_send_list(pdu == 0x04 ? 0x05 : 0x07, tid, empty, 2, maxc, 0);
+        return;
+    }
+    blen = build_attr_body(s_sdp_body, (int)sizeof(s_sdp_body), filter, flen);
+    if (blen < 0) {
+        sdp_error(tid, 0x0006);
+        return;
+    }
+    wlen = wrap_attrs(s_sdp_wrap, (int)sizeof(s_sdp_wrap), s_sdp_body, blen, pdu == 0x06);
+    if (wlen < 0) {
+        sdp_error(tid, 0x0006);
+        return;
+    }
+    sdp_send_list(pdu == 0x04 ? 0x05 : 0x07, tid, s_sdp_wrap, wlen, maxc, offset);
+}
+
+static int stored_id(uint16_t id)
+{
+    int i;
+    for (i = 0; i < s_id_n; i++) {
+        if (s_ids[i] == id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void serve_full_sdp(void)
+{
+    uint16_t got;
+    s_own_sdp = 1;
+    got = L2CA_Register(0x0001, &s_appl);
+    if (got == 0) {
+        s_own_sdp = 0;
+        ESP_LOGE(TAG, "could not take SDP PSM 0x0001");
+        return;
+    }
+    ESP_LOGE(TAG, "required HID attribute missing from the SDP DB; serving the full RVL-CNT-01 record on PSM 0x0001");
+}
+
 static void add_hid_record(void)
 {
-    uint32_t handle = SDP_CreateRecord();
+    uint32_t handle;
     uint16_t hid = 0x1124;
-    uint16_t browse = 0x1002;
     wm_sdp_proto_t proto[2];
     wm_sdp_proto_list_t extra;
     uint8_t list[sizeof(s_rvl_hid_report) + 8];
-    uint8_t lang[8];
     uint8_t *p;
     uint8_t inner;
-    /* Bluedroid's SDP record pad is 300 bytes (CONFIG_BT_SDP_PAD_LEN). The
-     * descriptor list value is 223 bytes, so the text attributes from the
-     * dump (0x0100 name, 0x0101 description, 0x0102 provider) and the
-     * language base (0x0006) do not fit beside it. The GAP name is already
-     * "Nintendo RVL-CNT-01". Attributes are added in id order so a rejected
-     * add cannot shift a stored attribute out of the record. */
+    uint8_t subclass = 0x04;
+    uint8_t reconnect = 1;
+    uint8_t virtual_cable = 0;
+    int desc_len;
+    /* Arduino-ESP32 3.3.12 libbt (HID device and SDP common compiled out)
+     * allows 8 attributes per record, counting the handle CreateRecord
+     * inserts. The 217-byte descriptor is not what rejected 0x0202; that
+     * attribute was the 9th. Keep only the attributes a console reads,
+     * in the order they must survive a full table. */
+    ESP_LOGE(TAG,
+             "SDP limits (3.3.12 libbt) MAX_REC_ATTR %d (includes handle), MAX_ATTR_LEN %d, MAX_PAD_LEN %d, MAX_RECORDS %d, record %d",
+             WM_SDP_MAX_REC_ATTR, WM_SDP_MAX_ATTR_LEN, WM_SDP_MAX_PAD_LEN,
+             WM_SDP_MAX_RECORDS, WM_SDP_RECORD_BYTES);
+    s_slots = 0;
+    s_pad = 0;
+    s_id_n = 0;
+    s_got_0202 = 0;
+    s_got_0206 = 0;
+    s_own_sdp = 0;
     if (sizeof(s_rvl_hid_report) != 217 || sizeof(s_rvl_hid_report) > 255) {
         ESP_LOGE(TAG, "HID descriptor length %u is not the RVL-CNT-01 dump",
                  (unsigned)sizeof(s_rvl_hid_report));
+        serve_full_sdp();
         return;
     }
+    handle = SDP_CreateRecord();
     if (handle == 0) {
         ESP_LOGE(TAG, "SDP_CreateRecord failed");
+        serve_full_sdp();
         return;
     }
-    note_attr(0x0001, SDP_AddServiceClassIdList(handle, 1, &hid));
+    s_slots = 1;
+    s_pad = 4;
+    remember_id(0x0000);
+
+    store_attr(handle, 0x0001, 3, SDP_AddServiceClassIdList(handle, 1, &hid));
+
     memset(proto, 0, sizeof(proto));
     proto[0].protocol_uuid = 0x0100;
     proto[0].num_params = 1;
     proto[0].params[0] = 0x0011;
     proto[1].protocol_uuid = 0x0011;
     proto[1].num_params = 0;
-    note_attr(0x0004, SDP_AddProtocolList(handle, 2, proto));
-    note_attr(0x0005, SDP_AddUuidSequence(handle, 0x0005, 1, &browse));
-    note_attr(0x0009, SDP_AddProfileDescriptorList(handle, hid, 0x0100));
+    store_attr(handle, 0x0004, 13, SDP_AddProtocolList(handle, 2, proto));
+
     memset(&extra, 0, sizeof(extra));
     extra.num_elems = 2;
     extra.list_elem[0].protocol_uuid = 0x0100;
     extra.list_elem[0].num_params = 1;
     extra.list_elem[0].params[0] = 0x0013;
     extra.list_elem[1].protocol_uuid = 0x0011;
-    note_attr(0x000d, SDP_AddAdditionProtoLists(handle, 1, &extra));
-    add_u16(handle, 0x0200, 0x0100);
-    add_u16(handle, 0x0201, 0x0111);
-    add_u8(handle, 0x0202, 0x04);
-    add_u8(handle, 0x0203, 0x33);
-    add_bool(handle, 0x0204, 0);
-    add_bool(handle, 0x0205, 1);
+    store_attr(handle, 0x000d, 15, SDP_AddAdditionProtoLists(handle, 1, &extra));
+
+    store_attr(handle, 0x0009, 8, SDP_AddProfileDescriptorList(handle, hid, 0x0100));
+    store_attr(handle, 0x0202, 1, SDP_AddAttribute(handle, 0x0202, 1, 1, &subclass));
+
     inner = (uint8_t)(4 + sizeof(s_rvl_hid_report));
     p = list;
     *p++ = (uint8_t)((6 << 3) | 5);
@@ -467,24 +1139,25 @@ static void add_hid_record(void)
     *p++ = (uint8_t)sizeof(s_rvl_hid_report);
     memcpy(p, s_rvl_hid_report, sizeof(s_rvl_hid_report));
     p += sizeof(s_rvl_hid_report);
-    note_attr(0x0206, SDP_AddAttribute(handle, 0x0206, 6, (uint32_t)(p - list), list));
-    p = lang;
-    *p++ = (uint8_t)((6 << 3) | 5);
-    *p++ = 6;
-    *p++ = (uint8_t)((1 << 3) | 1);
-    *p++ = 0x04;
-    *p++ = 0x09;
-    *p++ = (uint8_t)((1 << 3) | 1);
-    *p++ = 0x01;
-    *p++ = 0x00;
-    note_attr(0x0207, SDP_AddAttribute(handle, 0x0207, 6, (uint32_t)(p - lang), lang));
-    add_bool(handle, 0x0208, 0);
-    add_bool(handle, 0x0209, 1);
-    add_bool(handle, 0x020a, 1);
-    add_u16(handle, 0x020b, 0x0100);
-    add_u16(handle, 0x020c, 0x0c80);
-    add_bool(handle, 0x020d, 0);
-    add_bool(handle, 0x020e, 0);
+    desc_len = (int)(p - list);
+    store_attr(handle, 0x0206, desc_len,
+               SDP_AddAttribute(handle, 0x0206, 6, (uint32_t)desc_len, list));
+
+    store_attr(handle, 0x0205, 1, SDP_AddAttribute(handle, 0x0205, 5, 1, &reconnect));
+    store_attr(handle, 0x0204, 1, SDP_AddAttribute(handle, 0x0204, 5, 1, &virtual_cable));
+
+    log_stored_ids();
+    /* Subclass and the descriptor are the ones the last log claimed without
+     * storing. Both PSMs have to be in the same record or the console still
+     * hangs up. 0x0204 is attempted and may be the attribute that does not fit. */
+    if (!stored_id(0x0001) || !stored_id(0x0004) || !stored_id(0x000d) ||
+        !stored_id(0x0009) || !s_got_0202 || !s_got_0206) {
+        /* Handle 0 would delete every record. The short record must not
+         * stay for Bluedroid to answer with. */
+        SDP_DeleteRecord(handle);
+        serve_full_sdp();
+        return;
+    }
     ESP_LOGE(TAG, "RVL-CNT-01 HID SDP record registered (subclass 0x04, PSM 0x11/0x13)");
 }
 
@@ -549,7 +1222,9 @@ static void register_hid_once(void)
     allow_role_switch();
     allow_hid_security();
     add_hid_record();
-    add_device_id_record();
+    if (!s_own_sdp) {
+        add_device_id_record();
+    }
     L2CA_Register(0x0011, &s_appl);
     L2CA_Register(0x0013, &s_appl);
     s_hid_ready = 1;
