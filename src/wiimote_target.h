@@ -13,8 +13,13 @@
 #error "Enable Bluetooth Classic with Bluedroid. This library does not speak BLE, and the HID device profile is not required."
 #endif
 
-/* IDF 4.4 builds L2CAP and SDP with Classic. IDF 5 leaves both off unless set. */
-#if ESP_IDF_VERSION_MAJOR >= 5
+/*
+ * ESP-IDF 5 can omit the L2CAP and SDP stacks unless those options are set.
+ * Arduino-ESP32 defines ARDUINO on every library translation unit and ships a
+ * fixed sdkconfig, so a sketch cannot turn the options on. The prebuilt
+ * Classic library still exports L2CA_* and SDP_* (A2DP/SPP pull them in).
+ */
+#if ESP_IDF_VERSION_MAJOR >= 5 && !defined(ARDUINO)
 #if !defined(CONFIG_BT_L2CAP_ENABLED) || !defined(CONFIG_BT_SDP_COMMON_ENABLED)
 #error "Enable CONFIG_BT_L2CAP_ENABLED and CONFIG_BT_SDP_COMMON_ENABLED. Classic HID device profile is not required."
 #endif

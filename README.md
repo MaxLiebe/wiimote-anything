@@ -14,10 +14,10 @@ ESP32-S3, C3, C6, and H2 do not have a BR/EDR radio. They cannot host this libra
 
 Targeted host SDKs:
 
-- Arduino-ESP32 2.0.17 (ESP-IDF 4.4.7) and Arduino-ESP32 3.x (ESP-IDF 5.1 and later), board **ESP32 Dev Module**
-- ESP-IDF 4.4 and 5.x with Bluedroid Classic enabled
+- Arduino-ESP32 2.0.17 (ESP-IDF 4.4.7) and 3.x, board **ESP32 Dev Module**. See the Arduino section for which prebuilt cores export the L2CAP and SDP symbols.
+- ESP-IDF 4.4 and 5.x with Bluedroid Classic enabled. On IDF 5 also enable `CONFIG_BT_L2CAP_ENABLED` and `CONFIG_BT_SDP_COMMON_ENABLED`.
 
-Arduino-ESP32 ships Classic HID *device* support compiled out of the prebuilt Bluetooth library, so this project registers L2CAP and SDP itself. You do not need `CONFIG_BT_HID_ENABLED`.
+Arduino-ESP32 ships Classic HID *device* support compiled out of the prebuilt Bluetooth library, so this project registers L2CAP and SDP itself. You do not need `CONFIG_BT_HID_ENABLED`. A sketch cannot edit the prebuilt sdkconfig.
 
 Nothing here is tied to one PCB. Buttons, sticks, rumble, LEDs, and the IMU are all in `wiimote_pins_t` or a callback.
 
@@ -51,7 +51,7 @@ Deliberately not implemented:
 
 ## Arduino
 
-Tested against the APIs Arduino-ESP32 2.0.17 and 3.x actually export (legacy I2C, GPIO, LEDC, and either the legacy ADC or the IDF 5 oneshot ADC). Copy this folder into your Arduino libraries directory, or point the CLI at it:
+Copy this folder into your Arduino libraries directory, or point the CLI at it:
 
 ```bash
 arduino-cli config set directories.user ~/Arduino   # if you have not already
@@ -69,6 +69,19 @@ arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 examples/BasicButton
 Open the serial monitor at 115200. Put the Wii in sync (red button behind the battery cover, or the system menu's pair screen), then reset the ESP32. The sketch prints `connected` and `disconnected`.
 
 On Arduino-ESP32 3.x the wrapper includes `esp32-hal-alloc-bt-classic-mem.h` when that header exists, so the core keeps Classic controller memory.
+
+`esp_bluedroid_init_with_cfg()` is used only when the header defines `BT_BLUEDROID_INIT_CONFIG_DEFAULT`. Arduino-ESP32 2.0.17 and 3.0.7 (IDF 5.1.4) do not have `esp_bluedroid_config_t`; those cores call `esp_bluedroid_init()`.
+
+The 3.x prebuilt sdkconfig leaves `CONFIG_BT_L2CAP_ENABLED` unset (and, from 3.2 onward, `CONFIG_BT_SDP_COMMON_ENABLED` unset as well). That does not remove the stack. A2DP and SPP are enabled, and `libbt.a` for the original ESP32 still exports `L2CA_Register`, `SDP_CreateRecord`, `SDP_AddAttribute`, `BTM_SetSecurityLevel`, and `btu_task_post`. Checked with `nm` on these archives, not by running the Arduino compiler:
+
+| Core | ESP-IDF | `esp_bluedroid_config_t` | L2CAP / SDP symbols in `libbt.a` |
+| --- | --- | --- | --- |
+| 2.0.17 | 4.4.7 | no | present |
+| 3.0.7 | 5.1.4 | no | present |
+| 3.2.1 | 5.4.2 | yes | present |
+| 3.3.12 | 5.5.5 | yes | present |
+
+None of those four cores omit the symbols, so they should link. HID device objects in the same archive are empty. Cores that were not unpacked (for example 3.1.x) were not checked.
 
 ## ESP-IDF component
 

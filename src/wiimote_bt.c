@@ -576,7 +576,7 @@ static esp_err_t bring_up_controller(void)
         }
     }
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
-#if ESP_IDF_VERSION_MAJOR >= 5
+#ifdef BT_BLUEDROID_INIT_CONFIG_DEFAULT
         esp_bluedroid_config_t bt_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
         err = esp_bluedroid_init_with_cfg(&bt_cfg);
 #else
