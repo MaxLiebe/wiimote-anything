@@ -90,6 +90,9 @@ extern uint8_t SDP_AddServiceClassIdList(uint32_t handle, uint16_t num_services,
 extern uint8_t SDP_AddUuidSequence(uint32_t handle, uint16_t attr_id, uint16_t num_uuids, uint16_t *uuids);
 extern uint8_t BTM_SetSecurityLevel(uint8_t is_originator, const char *name, uint8_t service_id,
                                     uint16_t sec_level, uint16_t psm, uint32_t proto_id, uint32_t chan_id);
+extern void BTM_SetDefaultLinkPolicy(uint16_t settings);
+extern uint8_t BTM_DeleteStoredLinkKey(uint8_t *bd_addr, void *cb);
+extern uint8_t L2CA_SetDesireRole(uint8_t new_role);
 extern bool btu_task_post(uint32_t sig, void *param, uint32_t timeout);
 /* Legacy security mode. Bluedroid boots in SSP (mode 4); the Wii drops that. */
 extern void btm_sec_init(uint8_t sec_mode);
@@ -109,6 +112,8 @@ static uint8_t s_last_leds;
 static uint8_t s_have_leds;
 static uint8_t s_last_rumble;
 static uint8_t s_have_rumble;
+static int s_hid_ready;
+static volatile int s_sync_window;
 
 static bool post_btu(void (*fn)(wm_bt_hdr_t *));
 
@@ -345,124 +350,142 @@ static void on_tx(uint16_t cid, uint16_t count)
     (void)count;
 }
 
-static int hid_descriptor(uint8_t *dst, int cap)
-{
-    static const uint8_t out_id[] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a};
-    static const uint8_t out_n[] = {1, 1, 2, 1, 1, 1, 21, 6, 21, 1, 1};
-    static const uint8_t in_id[] = {0x20, 0x21, 0x22, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x3d, 0x3e, 0x3f};
-    static const uint8_t in_n[] = {6, 21, 4, 2, 5, 10, 17, 21, 21, 21, 21, 21, 21, 21};
-    int n = 0;
-    size_t i;
-    if (cap < 220) {
-        return 0;
-    }
-    dst[n++] = 0x05; dst[n++] = 0x01;
-    dst[n++] = 0x09; dst[n++] = 0x05;
-    dst[n++] = 0xa1; dst[n++] = 0x01;
-    for (i = 0; i < sizeof(out_id); i++) {
-        dst[n++] = 0x85; dst[n++] = out_id[i];
-        dst[n++] = 0x75; dst[n++] = 0x08;
-        dst[n++] = 0x95; dst[n++] = out_n[i];
-        dst[n++] = 0x91; dst[n++] = 0x02;
-    }
-    for (i = 0; i < sizeof(in_id); i++) {
-        dst[n++] = 0x85; dst[n++] = in_id[i];
-        dst[n++] = 0x75; dst[n++] = 0x08;
-        dst[n++] = 0x95; dst[n++] = in_n[i];
-        dst[n++] = 0x81; dst[n++] = 0x02;
-    }
-    dst[n++] = 0xc0;
-    return n;
-}
+/* Dolphin hcidump of a real RVL-CNT-01 HID descriptor list (attr 0x0206).
+ * Output items are 0x91 0x00 and input items are 0x81 0x00, not the generic
+ * 0x02 data/variable/absolute flags. */
+static const uint8_t s_rvl_hid_report[] = {
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01,
+    0x85, 0x10, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x01, 0x06, 0x00, 0xff, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x11, 0x95, 0x01, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x12, 0x95, 0x02, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x13, 0x95, 0x01, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x14, 0x95, 0x01, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x15, 0x95, 0x01, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x16, 0x95, 0x15, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x17, 0x95, 0x06, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x18, 0x95, 0x15, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x19, 0x95, 0x01, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x1a, 0x95, 0x01, 0x09, 0x01, 0x91, 0x00,
+    0x85, 0x20, 0x95, 0x06, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x21, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x22, 0x95, 0x04, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x30, 0x95, 0x02, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x31, 0x95, 0x05, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x32, 0x95, 0x0a, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x33, 0x95, 0x11, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x34, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x35, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x36, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x37, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x3d, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x3e, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0x85, 0x3f, 0x95, 0x15, 0x09, 0x01, 0x81, 0x00,
+    0xc0,
+};
+
+static void note_attr(uint16_t attr, uint8_t ok);
 
 static void add_u16(uint32_t handle, uint16_t attr, uint16_t value)
 {
     uint8_t be[2] = {(uint8_t)(value >> 8), (uint8_t)value};
-    SDP_AddAttribute(handle, attr, 1, 2, be);
+    note_attr(attr, SDP_AddAttribute(handle, attr, 1, 2, be));
 }
 
 static void add_u8(uint32_t handle, uint16_t attr, uint8_t value)
 {
-    SDP_AddAttribute(handle, attr, 1, 1, &value);
+    note_attr(attr, SDP_AddAttribute(handle, attr, 1, 1, &value));
 }
 
 static void add_bool(uint32_t handle, uint16_t attr, uint8_t value)
 {
-    SDP_AddAttribute(handle, attr, 5, 1, &value);
+    note_attr(attr, SDP_AddAttribute(handle, attr, 5, 1, &value));
+}
+
+static void note_attr(uint16_t attr, uint8_t ok)
+{
+    if (!ok) {
+        ESP_LOGE(TAG, "SDP attr 0x%04x was not stored", attr);
+    }
 }
 
 static void add_hid_record(void)
 {
     uint32_t handle = SDP_CreateRecord();
     uint16_t hid = 0x1124;
-    uint8_t desc[220];
-    int desc_len;
-    uint8_t *list;
-    uint8_t *p;
-    uint8_t seq_len;
-    uint8_t name[] = "Nintendo RVL-CNT-01";
     uint16_t browse = 0x1002;
     wm_sdp_proto_t proto[2];
     wm_sdp_proto_list_t extra;
+    uint8_t list[sizeof(s_rvl_hid_report) + 8];
     uint8_t lang[8];
+    uint8_t *p;
+    uint8_t inner;
+    /* Bluedroid's SDP record pad is 300 bytes (CONFIG_BT_SDP_PAD_LEN). The
+     * descriptor list value is 223 bytes, so the text attributes from the
+     * dump (0x0100 name, 0x0101 description, 0x0102 provider) and the
+     * language base (0x0006) do not fit beside it. The GAP name is already
+     * "Nintendo RVL-CNT-01". Attributes are added in id order so a rejected
+     * add cannot shift a stored attribute out of the record. */
+    if (sizeof(s_rvl_hid_report) != 217 || sizeof(s_rvl_hid_report) > 255) {
+        ESP_LOGE(TAG, "HID descriptor length %u is not the RVL-CNT-01 dump",
+                 (unsigned)sizeof(s_rvl_hid_report));
+        return;
+    }
     if (handle == 0) {
         ESP_LOGE(TAG, "SDP_CreateRecord failed");
         return;
     }
-    SDP_AddServiceClassIdList(handle, 1, &hid);
+    note_attr(0x0001, SDP_AddServiceClassIdList(handle, 1, &hid));
     memset(proto, 0, sizeof(proto));
     proto[0].protocol_uuid = 0x0100;
     proto[0].num_params = 1;
     proto[0].params[0] = 0x0011;
     proto[1].protocol_uuid = 0x0011;
     proto[1].num_params = 0;
-    SDP_AddProtocolList(handle, 2, proto);
-    SDP_AddLanguageBaseAttrIDList(handle, 0x656e, 0x006a, 0x0100);
+    note_attr(0x0004, SDP_AddProtocolList(handle, 2, proto));
+    note_attr(0x0005, SDP_AddUuidSequence(handle, 0x0005, 1, &browse));
+    note_attr(0x0009, SDP_AddProfileDescriptorList(handle, hid, 0x0100));
     memset(&extra, 0, sizeof(extra));
     extra.num_elems = 2;
     extra.list_elem[0].protocol_uuid = 0x0100;
     extra.list_elem[0].num_params = 1;
     extra.list_elem[0].params[0] = 0x0013;
     extra.list_elem[1].protocol_uuid = 0x0011;
-    SDP_AddAdditionProtoLists(handle, 1, &extra);
-    SDP_AddAttribute(handle, 0x0100, 4, sizeof(name), name);
-    SDP_AddProfileDescriptorList(handle, hid, 0x0100);
+    note_attr(0x000d, SDP_AddAdditionProtoLists(handle, 1, &extra));
     add_u16(handle, 0x0200, 0x0100);
     add_u16(handle, 0x0201, 0x0111);
-    add_u8(handle, 0x0202, 0x08);
-    add_u8(handle, 0x0203, 0x21);
-    add_bool(handle, 0x0204, 1);
+    add_u8(handle, 0x0202, 0x04);
+    add_u8(handle, 0x0203, 0x33);
+    add_bool(handle, 0x0204, 0);
     add_bool(handle, 0x0205, 1);
-    desc_len = hid_descriptor(desc, (int)sizeof(desc));
-    seq_len = (uint8_t)(4 + desc_len);
-    list = (uint8_t *)malloc((size_t)seq_len + 2);
-    if (list != NULL) {
-        p = list;
-        *p++ = (uint8_t)((6 << 3) | 5);
-        *p++ = seq_len;
-        *p++ = (uint8_t)((1 << 3) | 0);
-        *p++ = 0x22;
-        *p++ = (uint8_t)((4 << 3) | 5);
-        *p++ = (uint8_t)desc_len;
-        memcpy(p, desc, (size_t)desc_len);
-        SDP_AddAttribute(handle, 0x0206, 6, (uint32_t)(seq_len + 2), list);
-        free(list);
-    }
+    inner = (uint8_t)(4 + sizeof(s_rvl_hid_report));
+    p = list;
+    *p++ = (uint8_t)((6 << 3) | 5);
+    *p++ = inner;
+    *p++ = (uint8_t)((1 << 3) | 0);
+    *p++ = 0x22;
+    *p++ = (uint8_t)((4 << 3) | 5);
+    *p++ = (uint8_t)sizeof(s_rvl_hid_report);
+    memcpy(p, s_rvl_hid_report, sizeof(s_rvl_hid_report));
+    p += sizeof(s_rvl_hid_report);
+    note_attr(0x0206, SDP_AddAttribute(handle, 0x0206, 6, (uint32_t)(p - list), list));
     p = lang;
     *p++ = (uint8_t)((6 << 3) | 5);
     *p++ = 6;
     *p++ = (uint8_t)((1 << 3) | 1);
-    *p++ = 0x04; *p++ = 0x09;
+    *p++ = 0x04;
+    *p++ = 0x09;
     *p++ = (uint8_t)((1 << 3) | 1);
-    *p++ = 0x01; *p++ = 0x00;
-    SDP_AddAttribute(handle, 0x0207, 6, (uint32_t)(p - lang), lang);
+    *p++ = 0x01;
+    *p++ = 0x00;
+    note_attr(0x0207, SDP_AddAttribute(handle, 0x0207, 6, (uint32_t)(p - lang), lang));
+    add_bool(handle, 0x0208, 0);
     add_bool(handle, 0x0209, 1);
     add_bool(handle, 0x020a, 1);
     add_u16(handle, 0x020b, 0x0100);
-    add_u16(handle, 0x020c, 0x1f40);
-    add_bool(handle, 0x020d, 1);
+    add_u16(handle, 0x020c, 0x0c80);
+    add_bool(handle, 0x020d, 0);
     add_bool(handle, 0x020e, 0);
-    SDP_AddUuidSequence(handle, 0x0005, 1, &browse);
+    ESP_LOGE(TAG, "RVL-CNT-01 HID SDP record registered (subclass 0x04, PSM 0x11/0x13)");
 }
 
 static void add_device_id_record(void)
@@ -470,6 +493,7 @@ static void add_device_id_record(void)
     uint32_t handle = SDP_CreateRecord();
     uint16_t pnp = 0x1200;
     if (handle == 0) {
+        ESP_LOGE(TAG, "device-id SDP record was not created");
         return;
     }
     SDP_AddServiceClassIdList(handle, 1, &pnp);
@@ -483,18 +507,33 @@ static void add_device_id_record(void)
 
 static void allow_hid_security(void)
 {
-    /* No extra link security on the HID PSMs; the Wii bonds with the reversed BD_ADDR PIN. */
-    BTM_SetSecurityLevel(0, "HID", 51, 0, 0x0011, 6, 0);
-    BTM_SetSecurityLevel(1, "HID", 51, 0, 0x0011, 6, 0);
-    BTM_SetSecurityLevel(0, "HID", 52, 0, 0x0011, 6, 1);
-    BTM_SetSecurityLevel(1, "HID", 52, 0, 0x0011, 6, 1);
+    /* Level 0 on the no-security control and interrupt services. The first
+     * record for a PSM is what L2CAP checks, so the authenticated control
+     * service (id 51) is not registered. SDP PSM 0x0001 stays open as well.
+     * The Wii authenticates the ACL itself after the channels exist. */
+    BTM_SetSecurityLevel(0, "HID", 52, 0, 0x0011, 6, 4);
+    BTM_SetSecurityLevel(1, "HID", 52, 0, 0x0011, 6, 4);
     BTM_SetSecurityLevel(0, "HID", 53, 0, 0x0013, 6, 0);
     BTM_SetSecurityLevel(1, "HID", 53, 0, 0x0013, 6, 0);
+    BTM_SetSecurityLevel(0, "SDP", 0, 0, 0x0001, 0, 0);
+    BTM_SetSecurityLevel(1, "SDP", 0, 0, 0x0001, 0, 0);
 }
 
-static void register_cb(wm_bt_hdr_t *msg)
+static void allow_role_switch(void)
 {
-    free(msg);
+    /* Link policy bit 0x0001 lets the peer request a role switch. Desire
+     * role 1 accepts the inbound ACL as slave, so the Wii stays master.
+     * 0x80 clears the "disallow switch" flag on outgoing creates. */
+    BTM_SetDefaultLinkPolicy(0x0001 | 0x0002 | 0x0004 | 0x0008);
+    L2CA_SetDesireRole(0x80);
+    L2CA_SetDesireRole(0x01);
+}
+
+static void register_hid_once(void)
+{
+    if (s_hid_ready) {
+        return;
+    }
     memset(&s_appl, 0, sizeof(s_appl));
     s_appl.connect_ind = on_connect_ind;
     s_appl.connect_cfm = on_connect_cfm;
@@ -507,12 +546,38 @@ static void register_cb(wm_bt_hdr_t *msg)
     s_appl.data_ind = on_data;
     s_appl.congestion = on_cong;
     s_appl.tx_complete = on_tx;
+    allow_role_switch();
     allow_hid_security();
     add_hid_record();
     add_device_id_record();
     L2CA_Register(0x0011, &s_appl);
     L2CA_Register(0x0013, &s_appl);
-    ESP_LOGI(TAG, "L2CAP PSM 0x11 and 0x13 registered");
+    s_hid_ready = 1;
+    ESP_LOGE(TAG, "L2CAP PSM 0x11 and 0x13 registered");
+}
+
+static void register_cb(wm_bt_hdr_t *msg)
+{
+    free(msg);
+    register_hid_once();
+}
+
+static void open_window_cb(wm_bt_hdr_t *msg)
+{
+    uint8_t deleted;
+    free(msg);
+    register_hid_once();
+    /* NULL deletes every link key stored in the controller. */
+    deleted = BTM_DeleteStoredLinkKey(NULL, NULL);
+    ESP_LOGE(TAG, "controller link-key delete status %u", deleted);
+    if (!s_sync_window) {
+        return;
+    }
+    if (esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_LIMITED_DISCOVERABLE) != ESP_OK) {
+        ESP_LOGE(TAG, "limited-discoverable scan mode failed");
+        return;
+    }
+    ESP_LOGE(TAG, "connectable, limited-discoverable (LIAC)");
 }
 
 static void pump_cb(wm_bt_hdr_t *msg)
@@ -567,14 +632,150 @@ static void format_bda(const uint8_t *bda, char *out, size_t n)
              bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
 }
 
+static const char *gap_event_name(esp_bt_gap_cb_event_t event)
+{
+    switch (event) {
+    case ESP_BT_GAP_DISC_RES_EVT: return "DISC_RES";
+    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: return "DISC_STATE_CHANGED";
+    case ESP_BT_GAP_RMT_SRVCS_EVT: return "RMT_SRVCS";
+    case ESP_BT_GAP_RMT_SRVC_REC_EVT: return "RMT_SRVC_REC";
+    case ESP_BT_GAP_AUTH_CMPL_EVT: return "AUTH_CMPL";
+    case ESP_BT_GAP_PIN_REQ_EVT: return "PIN_REQ";
+    case ESP_BT_GAP_CFM_REQ_EVT: return "CFM_REQ";
+    case ESP_BT_GAP_KEY_NOTIF_EVT: return "KEY_NOTIF";
+    case ESP_BT_GAP_KEY_REQ_EVT: return "KEY_REQ";
+    case ESP_BT_GAP_READ_RSSI_DELTA_EVT: return "READ_RSSI_DELTA";
+    case ESP_BT_GAP_CONFIG_EIR_DATA_EVT: return "CONFIG_EIR";
+    case ESP_BT_GAP_SET_AFH_CHANNELS_EVT: return "SET_AFH";
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT: return "READ_REMOTE_NAME";
+    case ESP_BT_GAP_MODE_CHG_EVT: return "MODE_CHG";
+    case ESP_BT_GAP_REMOVE_BOND_DEV_COMPLETE_EVT: return "REMOVE_BOND";
+    case ESP_BT_GAP_QOS_CMPL_EVT: return "QOS";
+    case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT: return "ACL_CONN";
+    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT: return "ACL_DISCONN";
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+    case ESP_BT_GAP_SET_PAGE_TO_EVT: return "SET_PAGE_TO";
+    case ESP_BT_GAP_GET_PAGE_TO_EVT: return "GET_PAGE_TO";
+    case ESP_BT_GAP_ACL_PKT_TYPE_CHANGED_EVT: return "ACL_PKT_TYPE";
+    case ESP_BT_GAP_ENC_CHG_EVT: return "ENC_CHG";
+    case ESP_BT_GAP_SET_MIN_ENC_KEY_SIZE_EVT: return "SET_MIN_ENC_KEY_SIZE";
+    case ESP_BT_GAP_GET_DEV_NAME_CMPL_EVT: return "GET_DEV_NAME";
+#endif
+    default: return "UNKNOWN";
+    }
+}
+
+static const char *pm_mode_name(esp_bt_pm_mode_t mode)
+{
+    switch (mode) {
+    case ESP_BT_PM_MD_ACTIVE: return "active";
+    case ESP_BT_PM_MD_HOLD: return "hold";
+    case ESP_BT_PM_MD_SNIFF: return "sniff";
+    case ESP_BT_PM_MD_PARK: return "park";
+    default: return "other";
+    }
+}
+
+static void log_gap_window(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
+{
+    char addr[18];
+    const char *name = gap_event_name(event);
+    if (param == NULL) {
+        ESP_LOGE(TAG, "GAP %s (%d)", name, (int)event);
+        return;
+    }
+    switch (event) {
+    case ESP_BT_GAP_DISC_RES_EVT:
+        format_bda(param->disc_res.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP DISC_RES %s props %d", addr, param->disc_res.num_prop);
+        break;
+    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
+        ESP_LOGE(TAG, "GAP DISC_STATE_CHANGED state %d", (int)param->disc_st_chg.state);
+        break;
+    case ESP_BT_GAP_RMT_SRVCS_EVT:
+        format_bda(param->rmt_srvcs.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP RMT_SRVCS %s stat %d uuids %d", addr,
+                 (int)param->rmt_srvcs.stat, param->rmt_srvcs.num_uuids);
+        break;
+    case ESP_BT_GAP_RMT_SRVC_REC_EVT:
+        format_bda(param->rmt_srvc_rec.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP RMT_SRVC_REC %s stat %d", addr, (int)param->rmt_srvc_rec.stat);
+        break;
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+        format_bda(param->auth_cmpl.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP AUTH_CMPL %s stat %d", addr, (int)param->auth_cmpl.stat);
+        break;
+    case ESP_BT_GAP_PIN_REQ_EVT:
+        format_bda(param->pin_req.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP PIN_REQ %s min16 %d", addr, param->pin_req.min_16_digit ? 1 : 0);
+        break;
+    case ESP_BT_GAP_CFM_REQ_EVT:
+        format_bda(param->cfm_req.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP CFM_REQ %s", addr);
+        break;
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+        format_bda(param->key_notif.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP KEY_NOTIF %s", addr);
+        break;
+    case ESP_BT_GAP_KEY_REQ_EVT:
+        format_bda(param->key_req.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP KEY_REQ %s", addr);
+        break;
+    case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
+        format_bda(param->read_rmt_name.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP READ_REMOTE_NAME %s stat %d name %s", addr,
+                 (int)param->read_rmt_name.stat, (char *)param->read_rmt_name.rmt_name);
+        break;
+    case ESP_BT_GAP_MODE_CHG_EVT:
+        format_bda(param->mode_chg.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP MODE_CHG %s mode %s (%u)", addr,
+                 pm_mode_name(param->mode_chg.mode), (unsigned)param->mode_chg.mode);
+        break;
+    case ESP_BT_GAP_REMOVE_BOND_DEV_COMPLETE_EVT:
+        format_bda(param->remove_bond_dev_cmpl.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP REMOVE_BOND %s stat %d", addr, (int)param->remove_bond_dev_cmpl.status);
+        break;
+    case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
+        format_bda(param->acl_conn_cmpl_stat.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP ACL_CONN %s handle %u status %d", addr,
+                 param->acl_conn_cmpl_stat.handle, (int)param->acl_conn_cmpl_stat.stat);
+        break;
+    case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
+        format_bda(param->acl_disconn_cmpl_stat.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP ACL_DISCONN %s handle %u reason %d", addr,
+                 param->acl_disconn_cmpl_stat.handle, (int)param->acl_disconn_cmpl_stat.reason);
+        break;
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+    case ESP_BT_GAP_ENC_CHG_EVT:
+        format_bda(param->enc_chg.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP ENC_CHG %s mode %u", addr, (unsigned)param->enc_chg.enc_mode);
+        break;
+    case ESP_BT_GAP_ACL_PKT_TYPE_CHANGED_EVT:
+        format_bda(param->set_acl_pkt_types.bda, addr, sizeof(addr));
+        ESP_LOGE(TAG, "GAP ACL_PKT_TYPE %s stat %d types 0x%04x", addr,
+                 (int)param->set_acl_pkt_types.status, param->set_acl_pkt_types.pkt_types);
+        break;
+#endif
+    default:
+        ESP_LOGE(TAG, "GAP %s (%d)", name, (int)event);
+        break;
+    }
+}
+
 static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 {
     char addr[18];
+    if (s_sync_window) {
+        log_gap_window(event, param);
+    }
+    if (param == NULL) {
+        return;
+    }
     if (event == ESP_BT_GAP_PIN_REQ_EVT) {
         esp_bt_pin_code_t pin;
         int i;
         format_bda(param->pin_req.bda, addr, sizeof(addr));
-        /* Host BD_ADDR, reversed, 6 bytes. Not an ASCII PIN and not SSP. */
+        /* Peer BD_ADDR, reversed, 6 bytes. Only when the Wii asks. Not SSP. */
         for (i = 0; i < 6; i++) {
             pin[i] = param->pin_req.bda[5 - i];
         }
@@ -591,18 +792,18 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     } else if (event == ESP_BT_GAP_KEY_NOTIF_EVT) {
         format_bda(param->key_notif.bda, addr, sizeof(addr));
         ESP_LOGE(TAG, "SSP passkey notification from %s ignored", addr);
-    } else if (event == ESP_BT_GAP_AUTH_CMPL_EVT) {
+    } else if (!s_sync_window && event == ESP_BT_GAP_AUTH_CMPL_EVT) {
         format_bda(param->auth_cmpl.bda, addr, sizeof(addr));
         if (param->auth_cmpl.stat != ESP_BT_STATUS_SUCCESS) {
             ESP_LOGE(TAG, "auth fail %s status %d", addr, (int)param->auth_cmpl.stat);
         } else {
             ESP_LOGE(TAG, "auth ok %s", addr);
         }
-    } else if (event == ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT) {
+    } else if (!s_sync_window && event == ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT) {
         format_bda(param->acl_conn_cmpl_stat.bda, addr, sizeof(addr));
         ESP_LOGE(TAG, "ACL up %s handle %u status %d", addr,
                  param->acl_conn_cmpl_stat.handle, (int)param->acl_conn_cmpl_stat.stat);
-    } else if (event == ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT) {
+    } else if (!s_sync_window && event == ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT) {
         format_bda(param->acl_disconn_cmpl_stat.bda, addr, sizeof(addr));
         ESP_LOGE(TAG, "ACL down %s handle %u reason %d", addr,
                  param->acl_disconn_cmpl_stat.handle, (int)param->acl_disconn_cmpl_stat.reason);
@@ -713,35 +914,66 @@ esp_err_t wiimote_bt_start(void)
     return esp_timer_start_periodic(s_timer, 5000);
 }
 
+static void forget_link_keys(void)
+{
+    esp_bd_addr_t list[16];
+    int n = esp_bt_gap_get_bond_device_num();
+    int i;
+    if (n < 0) {
+        ESP_LOGE(TAG, "bond list unavailable (%d)", n);
+        return;
+    }
+    if (n == 0) {
+        ESP_LOGE(TAG, "no stored link key");
+        return;
+    }
+    if (n > (int)(sizeof(list) / sizeof(list[0]))) {
+        n = (int)(sizeof(list) / sizeof(list[0]));
+    }
+    if (esp_bt_gap_get_bond_device_list(&n, list) != ESP_OK) {
+        ESP_LOGE(TAG, "bond list read failed");
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        esp_err_t err = esp_bt_gap_remove_bond_device(list[i]);
+        ESP_LOGE(TAG, "remove link key %02x:%02x:%02x:%02x:%02x:%02x -> %s",
+                 list[i][0], list[i][1], list[i][2], list[i][3], list[i][4], list[i][5],
+                 esp_err_to_name(err));
+    }
+}
+
 esp_err_t wiimote_bt_sync(void)
 {
     esp_err_t err;
     /* The Wii's red SYNC button inquires on LIAC. A real remote does not
      * inquire; it is limited-discoverable and connectable. Class of device
      * is published first so 0x002504 is on the air before inquiry scan.
-     * esp_bt_gap_set_scan_mode(CONNECTABLE, LIMITED) is the 3.3.12 and IDF 5
-     * pair. Limited mode writes IAC LAPs LIAC 0x9E8B00 and GIAC 0x9E8B33
-     * and turns inquiry scan on. Connectable keeps page scan on. An
-     * outbound inquiry would take the radio out of inquiry scan. */
+     * The HID SDP record is registered on the BTU task before scan mode
+     * turns inquiry scan on. Limited mode writes IAC LAPs LIAC 0x9E8B00
+     * and GIAC 0x9E8B33. Connectable keeps page scan on. Stored link keys
+     * are deleted here; bonding starts only if the Wii sends a PIN request. */
     err = publish_wiimote_cod();
     if (err != ESP_OK) {
         return err;
     }
-    err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_LIMITED_DISCOVERABLE);
-    if (err != ESP_OK) {
-        return err;
+    forget_link_keys();
+    s_sync_window = 1;
+    if (!post_btu(open_window_cb)) {
+        s_sync_window = 0;
+        return ESP_FAIL;
     }
-    ESP_LOGE(TAG, "connectable, limited-discoverable (LIAC)");
     return ESP_OK;
 }
 
 void wiimote_bt_listen_only(void)
 {
+    s_sync_window = 0;
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
 }
 
 esp_err_t wiimote_bt_stop(void)
 {
+    s_sync_window = 0;
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
     if (!post_btu(stop_cb)) {
         return ESP_FAIL;
