@@ -22,6 +22,17 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
+#if defined(ARDUINO)
+/* Arduino 3.x frees Classic and BLE controller pools in initArduino() unless
+ * a constructor marks that pool in use. A BTDM prebuilt (3.3.12) needs both. */
+#if __has_include("esp32-hal-alloc-bt-classic-mem.h")
+#include "esp32-hal-alloc-bt-classic-mem.h"
+#endif
+#if __has_include("esp32-hal-alloc-ble-mem.h")
+#include "esp32-hal-alloc-ble-mem.h"
+#endif
+#endif
+
 #define L2CAP_MIN_OFFSET 13
 #define BTU_HACK_EVENT 0x1700
 #define SIG_BTU_HCI_MSG 1
@@ -561,16 +572,24 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 static esp_err_t bring_up_controller(void)
 {
     esp_err_t err;
+    /* Magic, mode, and stack come from the headers this translation unit
+     * actually included. Arduino-ESP32 3.3.12's libbt.a is BTDM, so that
+     * default mode is ESP_BT_MODE_BTDM. Overriding it to Classic, or
+     * releasing a pool the chosen mode still needs, makes
+     * esp_bt_controller_init return ESP_ERR_INVALID_ARG. Enable must use
+     * the same mode init was given. */
     esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE) {
-        esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        if (cfg.mode == ESP_BT_MODE_CLASSIC_BT) {
+            esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        }
         err = esp_bt_controller_init(&cfg);
         if (err != ESP_OK) {
             return err;
         }
     }
     if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) {
-        err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+        err = esp_bt_controller_enable((esp_bt_mode_t)cfg.mode);
         if (err != ESP_OK) {
             return err;
         }

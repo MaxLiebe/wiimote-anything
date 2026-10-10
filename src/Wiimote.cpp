@@ -5,6 +5,9 @@
 #if __has_include("esp32-hal-alloc-bt-classic-mem.h")
 #include "esp32-hal-alloc-bt-classic-mem.h"
 #endif
+#if __has_include("esp32-hal-alloc-ble-mem.h")
+#include "esp32-hal-alloc-ble-mem.h"
+#endif
 #endif
 
 bool Wiimote::begin(const wiimote_config_t *config)
