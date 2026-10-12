@@ -73,12 +73,26 @@ typedef struct {
     uint8_t battery; /**< Starting battery byte. 0xC0 is a healthy pack. */
     const wiimote_pins_t *pins;
     const wiimote_callbacks_t *callbacks;
+    /**
+     * For BTstack / Bluepad32 integration:
+     * When true, Wiimote assumes BTstack is already initialized and managed externally
+     * (e.g. by Bluepad32 or custom app), so it attaches to the existing run loop without
+     * reinitializing the ESP32 controller. Default false.
+     */
+    bool external_stack;
 } wiimote_config_t;
 
 /** Set every GPIO to -1, buttons active-low, ADC spans 0..4095 centered at 2048. */
 void wiimote_pins_init(wiimote_pins_t *pins);
 
 esp_err_t wiimote_init(const wiimote_config_t *config);
+
+/**
+ * Register Wiimote L2CAP services and SDP records into an active BTstack instance.
+ * Useful when integrating into Bluepad32 or custom BTstack event loops.
+ */
+esp_err_t wiimote_btstack_register_services(void);
+
 /**
  * For 20 seconds, be connectable and limited-discoverable so a Wii that
  * pressed its red SYNC button can inquire on LIAC and open the ACL.

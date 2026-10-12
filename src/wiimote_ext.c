@@ -35,25 +35,42 @@ static void put_be16(uint8_t *p, uint16_t value)
     p[1] = (uint8_t)value;
 }
 
-static void seal_sum(uint8_t *block, size_t len)
+static void seal_ext_cal(uint8_t *block)
 {
     size_t i;
     unsigned sum = 0x55;
-    for (i = 0; i + 1 < len; i++) {
+    for (i = 0; i < 14; i++) {
         sum += block[i];
     }
-    block[len - 1] = (uint8_t)sum;
+    block[14] = (uint8_t)sum;
+    block[15] = (uint8_t)(sum + 0x55);
 }
 
 static void write_nunchuk_cal(uint8_t *reg)
 {
     /* 0 g at 512, +1 g at 0x26A, stick max/min/center. Duplicate lives at 0x30. */
-    static const uint8_t body[] = {
+    static const uint8_t body[14] = {
         0x80, 0x80, 0x80, 0x00, 0x9a, 0x9a, 0x9a, 0x2a,
-        0xe0, 0x1e, 0x80, 0xe0, 0x1e, 0x80, 0x00
+        0xe0, 0x1e, 0x80, 0xe0, 0x1e, 0x80
     };
     memcpy(reg + 0x20, body, sizeof(body));
-    seal_sum(reg + 0x20, 16);
+    seal_ext_cal(reg + 0x20);
+    memcpy(reg + 0x30, reg + 0x20, 16);
+}
+
+static void write_classic_cal(uint8_t *reg)
+{
+    /* Left/Right stick X/Y max (0xe0), min (0x20), center (0x80) in 8-bit scale,
+     * Left/Right trigger neutral (0x00, 0x00), plus 2-byte checksum (sum+0x55, sum+0xaa). */
+    static const uint8_t body[14] = {
+        0xe0, 0x20, 0x80, /* Left Stick X: max, min, center */
+        0xe0, 0x20, 0x80, /* Left Stick Y: max, min, center */
+        0xe0, 0x20, 0x80, /* Right Stick X: max, min, center */
+        0xe0, 0x20, 0x80, /* Right Stick Y: max, min, center */
+        0x00, 0x00        /* Left/Right Trigger neutral */
+    };
+    memcpy(reg + 0x20, body, sizeof(body));
+    seal_ext_cal(reg + 0x20);
     memcpy(reg + 0x30, reg + 0x20, 16);
 }
 
@@ -116,7 +133,7 @@ static void apply_visibility(wiimote_ext_t *ext)
         ext->a4_visible = true;
         memcpy(ext->a4 + 0xfa,
                ext->type == WIIMOTE_EXT_CLASSIC_PRO ? k_id_classic_pro : k_id_classic, 6);
-        write_nunchuk_cal(ext->a4);
+        write_classic_cal(ext->a4);
         return;
     }
     ext->a4_visible = false;

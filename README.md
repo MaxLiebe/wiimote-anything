@@ -2,9 +2,13 @@
 
 The ESP32 is the Wiimote. A real Wii is the host.
 
-This library speaks Bluetooth Classic HID the way a Nintendo RVL-CNT-01 does: device name `Nintendo RVL-CNT-01`, class of device `0x002504`, L2CAP PSM `0x11` (control) and `0x13` (interrupt), report headers `0xA2` / `0xA1`, and the extension bus games actually initialize. Pairing during sync uses the Wii's BD_ADDR reversed as the PIN. Link keys stay in the normal Bluedroid NVS store. There is no Wi-Fi and no cloud.
+This library speaks Bluetooth Classic HID the way a Nintendo RVL-CNT-01 does: device name `Nintendo RVL-CNT-01`, class of device `0x002504`, L2CAP PSM `0x11` (control) and `0x13` (interrupt), report headers `0xA2` / `0xA1`, and the extension bus games actually initialize. Pairing during sync uses the Wii's BD_ADDR reversed as the PIN. There is no Wi-Fi and no cloud.
 
-The stack is C and uses the ESP-IDF Bluetooth and driver APIs only. `src/Wiimote.h` is a thin C++ wrapper for Arduino sketches. It does not pull Arduino types into the protocol code.
+The library features dual Bluetooth backends:
+1. **BTstack Backend (Primary / Recommended):** Lightweight, standards-compliant, and built to seamlessly combine with **[Bluepad32](https://github.com/ricardoquesada/bluepad32)** to create a controller-to-Wiimote adapter on a single ESP32. Does not suffer from Bluedroid's 8-attribute SDP limitation.
+2. **Bluedroid Backend (Fallback):** Provides zero-setup plug-and-play compatibility for stock Arduino-ESP32 installations where BTstack is not installed.
+
+The stack is C and uses ESP-IDF / BTstack APIs. `src/Wiimote.h` is a thin C++ wrapper for Arduino sketches. It does not pull Arduino types into the protocol code.
 
 ## Hardware
 
@@ -14,12 +18,28 @@ ESP32-S3, C3, C6, and H2 do not have a BR/EDR radio. They cannot host this libra
 
 Targeted host SDKs:
 
-- Arduino-ESP32 2.0.17 (ESP-IDF 4.4.7) and 3.x, board **ESP32 Dev Module**. See the Arduino section for which prebuilt cores export the L2CAP and SDP symbols.
-- ESP-IDF 4.4 and 5.x with Bluedroid Classic enabled. On IDF 5 also enable `CONFIG_BT_L2CAP_ENABLED` and `CONFIG_BT_SDP_COMMON_ENABLED`.
+- **Bluepad32 / BTstack (ESP-IDF 4.4 & 5.x):** The premier setup for controller-to-Wiimote adapters. Both Bluepad32 (HID Host) and WiimoteAnything (HID Device) run concurrently on the same BTstack engine on a single ESP32!
+- **ESP-IDF with BTstack component:** Dedicated standalone BTstack builds (`examples/BTstackStandalone`).
+- **Arduino-ESP32 2.0.17 and 3.x:** Board **ESP32 Dev Module**. Automatically uses the Bluedroid fallback if BTstack is not present, or BTstack if available.
+- **ESP-IDF with Bluedroid Classic enabled:** On IDF 5 enable `CONFIG_BT_L2CAP_ENABLED` and `CONFIG_BT_SDP_COMMON_ENABLED`.
 
-Arduino-ESP32 ships Classic HID *device* support compiled out of the prebuilt Bluetooth library, so this project registers L2CAP and SDP itself. You do not need `CONFIG_BT_HID_ENABLED`. A sketch cannot edit the prebuilt sdkconfig.
+## Bluepad32 Controller Adapter
 
-Nothing here is tied to one PCB. Buttons, sticks, rumble, LEDs, and the IMU are all in `wiimote_pins_t` or a callback.
+Combining WiimoteAnything with Bluepad32 allows you to connect modern wireless gamepads (DualSense, DualShock 4, Xbox Wireless, Switch Pro, 8BitDo) to the ESP32 via Bluetooth and output them to a Nintendo Wii as a Wiimote + Classic Controller in real time:
+
+See [`examples/Bluepad32_Wiimote_Adapter`](examples/Bluepad32_Wiimote_Adapter) for the complete implementation!
+
+```c
+// Bluepad32 manages BTstack; WiimoteAnything attaches to it:
+wiimote_config_t cfg = {
+    .extension = WIIMOTE_EXT_CLASSIC,
+    .battery = 0xC0,
+    .callbacks = &callbacks,
+    .external_stack = true,
+};
+wiimote_init(&cfg);
+wiimote_sync();
+```
 
 ## What a Wii will accept
 
@@ -92,9 +112,21 @@ idf.py set-target esp32
 idf.py build
 ```
 
-That project builds with ESP-IDF 5.4.2 for the original ESP32.
+That project builds with ESP-IDF 5.x for the original ESP32.
 
-Merge `sdkconfig.defaults` into the project. ESP-IDF 5 does not build Classic L2CAP or SDP unless you ask:
+### BTstack / Bluepad32 Configuration (sdkconfig.defaults):
+
+```
+CONFIG_BT_ENABLED=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=n
+CONFIG_BT_CONTROLLER_ONLY=y
+```
+
+### Bluedroid Fallback Configuration:
+
+If using the legacy Bluedroid backend on ESP-IDF 5 instead:
 
 ```
 CONFIG_BT_ENABLED=y
@@ -104,8 +136,6 @@ CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
 CONFIG_BT_L2CAP_ENABLED=y
 CONFIG_BT_SDP_COMMON_ENABLED=y
 ```
-
-ESP-IDF 4.4 builds L2CAP and SDP with Classic, so those last two options are not in 4.4. The controller mode should be BR/EDR only or dual mode, not BLE only.
 
 ```c
 #include "wiimote.h"

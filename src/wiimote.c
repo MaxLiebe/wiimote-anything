@@ -155,6 +155,9 @@ void wiimote_set_connected(bool up)
 {
     bool was = s_connected;
     s_connected = up;
+    if (up) {
+        s_syncing = false;
+    }
     wiimote_lock();
     if (s_proto != NULL) {
         s_proto->link_up = up;
@@ -266,6 +269,7 @@ esp_err_t wiimote_init(const wiimote_config_t *config)
     }
     wiimote_proto_init(s_proto, config->extension, battery);
     wiimote_hw_init(config->pins);
+    wiimote_bt_set_external_stack(config->external_stack);
     err = wiimote_bt_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Bluetooth start failed: %s", esp_err_to_name(err));

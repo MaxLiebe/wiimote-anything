@@ -9,6 +9,7 @@ public:
     bool begin(const wiimote_config_t *config);
     bool sync();
     void stop();
+    bool registerBtstackServices();
 
     bool setExtension(wiimote_extension_t extension);
     bool setButton(wiimote_button_t button, bool pressed);

@@ -61,12 +61,25 @@ static void test_nunchuk_and_classic(void)
 
     wiimote_proto_init(&p, WIIMOTE_EXT_CLASSIC, 0xc0);
     wiimote_proto_build(&p, 0x32, pkt, sizeof(pkt));
+    CHECK(pkt[4] == 0x82 && pkt[5] == 0x80 && pkt[6] == 0x80 && pkt[7] == 0x00);
     CHECK(pkt[8] == 0xff);
     CHECK(pkt[9] == 0xff);
     wiimote_proto_set_button(&p, WIIMOTE_BUTTON_CLASSIC_A, true);
     wiimote_proto_build(&p, 0x32, pkt, sizeof(pkt));
     CHECK(pkt[9] == (uint8_t)~0x10);
     CHECK((pkt[8] & 0x01) == 0x01);
+
+    {
+        const uint8_t read_cal[] = {0x17, 0x04, 0xa4, 0x00, 0x20, 0x00, 0x10};
+        feed(&p, read_cal, sizeof(read_cal));
+        CHECK(take(&p, pkt, 0) == 23);
+        CHECK(pkt[1] == 0x21);
+        /* LX max=0xe0, min=0x20, center=0x80; LY max=0xe0, min=0x20, center=0x80 */
+        CHECK(pkt[7] == 0xe0 && pkt[8] == 0x20 && pkt[9] == 0x80);
+        CHECK(pkt[10] == 0xe0 && pkt[11] == 0x20 && pkt[12] == 0x80);
+        /* 2-byte checksum: block[15] == (uint8_t)(block[14] + 0x55) */
+        CHECK(pkt[22] == (uint8_t)(pkt[21] + 0x55));
+    }
 }
 
 static void test_extension_init_and_missing(void)

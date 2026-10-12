@@ -25,6 +25,11 @@ void Wiimote::stop()
     wiimote_stop();
 }
 
+bool Wiimote::registerBtstackServices()
+{
+    return wiimote_btstack_register_services() == ESP_OK;
+}
+
 bool Wiimote::setExtension(wiimote_extension_t extension)
 {
     return wiimote_set_extension(extension) == ESP_OK;
