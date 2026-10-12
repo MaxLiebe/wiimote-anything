@@ -87,9 +87,21 @@ static void adapter_init(int argc, const char **argv)
     ESP_LOGI(TAG, "Bluepad32 custom platform init");
 }
 
+static float apply_deadzone(float v, float dz)
+{
+    if (v > -dz && v < dz) {
+        return 0.0f;
+    }
+    return v;
+}
+
 static void adapter_on_init_complete(void)
 {
     ESP_LOGI(TAG, "Bluepad32 init complete; starting 20s Wiimote sync window (press red SYNC on Wii console)");
+
+    /* Disable Bluepad32 BLE configuration service and DualSense virtual touchpad device */
+    uni_bt_service_set_enabled(false);
+    uni_virtual_device_set_enabled(false);
 
     /* Initialize WiimoteAnything into the running BTstack */
     ESP_ERROR_CHECK(wiimote_init(&s_wm_cfg));
@@ -144,36 +156,65 @@ static void adapter_on_controller_data(uni_hid_device_t *d, uni_controller_t *ct
 
     uni_gamepad_t *gp = &ctl->gamepad;
 
-    /* D-pad */
-    wiimote_set_button(WIIMOTE_BUTTON_UP, (gp->dpad & DPAD_UP) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_DOWN, (gp->dpad & DPAD_DOWN) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_LEFT, (gp->dpad & DPAD_LEFT) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_RIGHT, (gp->dpad & DPAD_RIGHT) != 0);
+    bool dpad_up    = (gp->dpad & DPAD_UP) != 0;
+    bool dpad_down  = (gp->dpad & DPAD_DOWN) != 0;
+    bool dpad_left  = (gp->dpad & DPAD_LEFT) != 0;
+    bool dpad_right = (gp->dpad & DPAD_RIGHT) != 0;
 
-    /* Main face buttons (mapped to Classic Controller A/B/X/Y) */
-    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_A, (gp->buttons & BUTTON_A) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_B, (gp->buttons & BUTTON_B) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_X, (gp->buttons & BUTTON_X) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_Y, (gp->buttons & BUTTON_Y) != 0);
+    /* D-pad (both Core Wiimote and Classic Controller) */
+    wiimote_set_button(WIIMOTE_BUTTON_UP, dpad_up);
+    wiimote_set_button(WIIMOTE_BUTTON_DOWN, dpad_down);
+    wiimote_set_button(WIIMOTE_BUTTON_LEFT, dpad_left);
+    wiimote_set_button(WIIMOTE_BUTTON_RIGHT, dpad_right);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_UP, dpad_up);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_DOWN, dpad_down);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_LEFT, dpad_left);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_RIGHT, dpad_right);
 
-    /* Core Wiimote A and B triggers */
-    wiimote_set_button(WIIMOTE_BUTTON_A, (gp->buttons & BUTTON_A) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_B, (gp->buttons & BUTTON_SHOULDER_R) != 0);
+    /* Main face buttons (mapped to Classic Controller A/B/X/Y and Core Wiimote A/B/1/2) */
+    bool btn_a = (gp->buttons & BUTTON_A) != 0;
+    bool btn_b = (gp->buttons & BUTTON_B) != 0;
+    bool btn_x = (gp->buttons & BUTTON_X) != 0;
+    bool btn_y = (gp->buttons & BUTTON_Y) != 0;
 
-    /* System buttons */
-    wiimote_set_button(WIIMOTE_BUTTON_PLUS, (gp->misc_buttons & MISC_BUTTON_START) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_MINUS, (gp->misc_buttons & MISC_BUTTON_SELECT) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_HOME, (gp->misc_buttons & MISC_BUTTON_SYSTEM) != 0);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_A, btn_a);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_B, btn_b);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_X, btn_x);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_Y, btn_y);
 
-    /* Classic Shoulder Buttons */
-    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_ZL, (gp->buttons & BUTTON_TRIGGER_L) != 0);
-    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_ZR, (gp->buttons & BUTTON_TRIGGER_R) != 0);
+    wiimote_set_button(WIIMOTE_BUTTON_A, btn_a);
+    wiimote_set_button(WIIMOTE_BUTTON_B, btn_b || ((gp->buttons & BUTTON_SHOULDER_R) != 0));
+    wiimote_set_button(WIIMOTE_BUTTON_ONE, btn_x);
+    wiimote_set_button(WIIMOTE_BUTTON_TWO, btn_y);
+
+    /* System buttons (both Core Wiimote and Classic Controller) */
+    bool btn_plus  = (gp->misc_buttons & MISC_BUTTON_START) != 0;
+    bool btn_minus = (gp->misc_buttons & MISC_BUTTON_SELECT) != 0;
+    bool btn_home  = (gp->misc_buttons & MISC_BUTTON_SYSTEM) != 0;
+
+    wiimote_set_button(WIIMOTE_BUTTON_PLUS, btn_plus);
+    wiimote_set_button(WIIMOTE_BUTTON_MINUS, btn_minus);
+    wiimote_set_button(WIIMOTE_BUTTON_HOME, btn_home);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_PLUS, btn_plus);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_MINUS, btn_minus);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_HOME, btn_home);
+
+    /* Classic Shoulder and Trigger Buttons */
+    bool sh_l = (gp->buttons & BUTTON_SHOULDER_L) != 0;
+    bool sh_r = (gp->buttons & BUTTON_SHOULDER_R) != 0;
+    bool tr_l = (gp->buttons & BUTTON_TRIGGER_L) != 0 || (gp->brake > 256);
+    bool tr_r = (gp->buttons & BUTTON_TRIGGER_R) != 0 || (gp->throttle > 256);
+
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_L, tr_l);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_R, tr_r);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_ZL, sh_l);
+    wiimote_set_button(WIIMOTE_BUTTON_CLASSIC_ZR, sh_r);
 
     /* Analog Sticks (-1.0 to +1.0; Bluepad32 axis values are -512 to +511) */
-    float lx = (float)gp->axis_x / 512.0f;
-    float ly = -(float)gp->axis_y / 512.0f;
-    float rx = (float)gp->axis_rx / 512.0f;
-    float ry = -(float)gp->axis_ry / 512.0f;
+    float lx = apply_deadzone((float)gp->axis_x / 512.0f, 0.06f);
+    float ly = apply_deadzone(-(float)gp->axis_y / 512.0f, 0.06f);
+    float rx = apply_deadzone((float)gp->axis_rx / 512.0f, 0.06f);
+    float ry = apply_deadzone(-(float)gp->axis_ry / 512.0f, 0.06f);
 
     wiimote_set_axis(WIIMOTE_AXIS_CLASSIC_LX, lx);
     wiimote_set_axis(WIIMOTE_AXIS_CLASSIC_LY, ly);

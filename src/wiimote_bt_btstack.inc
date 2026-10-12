@@ -382,6 +382,8 @@ static void note_outputs(uint8_t leds, bool rumble)
     }
 }
 
+static uint32_t s_last_input_tx_ms = 0;
+
 static void flush_reports(void)
 {
     uint8_t pkt[32];
@@ -389,6 +391,7 @@ static void flush_reports(void)
     uint8_t leds;
     bool rumble;
     uint32_t now;
+    wiimote_proto_t *proto;
 
     if (!wiimote_ready() || s_cid_interrupt == 0) {
         return;
@@ -396,26 +399,65 @@ static void flush_reports(void)
 
     now = (uint32_t)(esp_timer_get_time() / 1000);
     wiimote_lock();
-    while (s_cid_interrupt != 0) {
+    proto = wiimote_state();
+
+    /* 1. Drain any queued protocol responses (status reports, memory read/write ACKs).
+     *    These are required by the Wii handshake and must be sent promptly. */
+    while (s_cid_interrupt != 0 && (proto->q_count > 0 || proto->read.active)) {
         if (!l2cap_can_send_packet_now(s_cid_interrupt)) {
             l2cap_request_can_send_now_event(s_cid_interrupt);
-            break;
+            leds = proto->leds;
+            rumble = proto->rumble;
+            wiimote_unlock();
+            note_outputs(leds, rumble);
+            return;
         }
-        n = wiimote_proto_poll(wiimote_state(), pkt, sizeof(pkt), now);
+        n = wiimote_proto_poll(proto, pkt, sizeof(pkt), now);
         if (n <= 0) {
             break;
         }
-        leds = wiimote_state()->leds;
-        rumble = wiimote_state()->rumble;
+        leds = proto->leds;
+        rumble = proto->rumble;
         wiimote_unlock();
 
         l2cap_send(s_cid_interrupt, pkt, (uint16_t)n);
         note_outputs(leds, rumble);
 
         wiimote_lock();
+        proto = wiimote_state();
     }
-    leds = wiimote_state()->leds;
-    rumble = wiimote_state()->rumble;
+
+    /* 2. Send at most ONE periodic input report per call, and NEVER request
+     *    L2CAP_EVENT_CAN_SEND_NOW for continuous input reports. Requesting CAN_SEND_NOW
+     *    for continuous input reports creates a back-to-back Slave TX chain on the Wii
+     *    link that starves the ESP32 Bluetooth Master piconet (gamepad link). */
+    if (s_cid_interrupt != 0 && l2cap_can_send_packet_now(s_cid_interrupt)) {
+        uint32_t min_interval_ms = 10;
+        if (s_outbound_busy_until_us > 0) {
+            min_interval_ms = 40;
+        } else if (s_gamepad_handle != HCI_CON_HANDLE_INVALID) {
+            /* Scatternet coexistence: send changed inputs at up to 40 Hz (25 ms)
+             * and unchanged keepalive frames at 25 Hz (40 ms) so the ESP32 radio
+             * spends >80% of slots servicing the Master gamepad link without latency. */
+            min_interval_ms = proto->have_last_payload ? 40 : 25;
+        }
+        if ((uint32_t)(now - s_last_input_tx_ms) >= min_interval_ms) {
+            n = wiimote_proto_poll(proto, pkt, sizeof(pkt), now);
+            if (n > 0) {
+                s_last_input_tx_ms = now;
+                leds = proto->leds;
+                rumble = proto->rumble;
+                wiimote_unlock();
+
+                l2cap_send(s_cid_interrupt, pkt, (uint16_t)n);
+                note_outputs(leds, rumble);
+                return;
+            }
+        }
+    }
+
+    leds = proto->leds;
+    rumble = proto->rumble;
     wiimote_unlock();
     note_outputs(leds, rumble);
 }
@@ -503,7 +545,6 @@ static void pump_pending_cmds(void)
 static void report_timer_cb(btstack_timer_source_t *ts)
 {
     int64_t now = esp_timer_get_time();
-    uint32_t next_ms = 10; /* 10 ms = 100 Hz report rate */
 
     if (s_name_req_pending && now >= s_name_req_cancel_at_us) {
         if (hci_get_state() == HCI_STATE_WORKING && hci_can_send_command_packet_now()) {
@@ -514,29 +555,22 @@ static void report_timer_cb(btstack_timer_source_t *ts)
         }
     }
 
-    if (s_outbound_busy_until_us > 0) {
-        if (now < s_outbound_busy_until_us) {
-            /* Throttle Wiimote reports to 25 Hz (40 ms) while an outbound gamepad
-             * name request / ACL page / SDP / L2CAP handshake is active so the ESP32
-             * radio has ample free slots to complete the gamepad connection. */
-            next_ms = 40;
-        } else {
-            s_outbound_busy_until_us = 0;
-            if (s_gamepad_connecting) {
-                s_gamepad_connecting = false;
-                if (s_gamepad_handle != HCI_CON_HANDLE_INVALID) {
-                    s_gamepad_connected = true;
-                } else {
-                    ESP_LOGI(TAG, "Gamepad connection attempt timed out; resuming scan");
-                    resume_gamepad_scanning();
-                }
+    if (s_outbound_busy_until_us > 0 && now >= s_outbound_busy_until_us) {
+        s_outbound_busy_until_us = 0;
+        if (s_gamepad_connecting) {
+            s_gamepad_connecting = false;
+            if (s_gamepad_handle != HCI_CON_HANDLE_INVALID) {
+                s_gamepad_connected = true;
+            } else {
+                ESP_LOGI(TAG, "Gamepad connection attempt timed out; resuming scan");
+                resume_gamepad_scanning();
             }
         }
     }
 
     pump_pending_cmds();
     flush_reports();
-    btstack_run_loop_set_timer(ts, next_ms);
+    btstack_run_loop_set_timer(ts, 10);
     btstack_run_loop_add_timer(ts);
 }
 
@@ -549,8 +583,10 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
             uint16_t opcode = hci_event_command_complete_get_command_opcode(packet);
             const uint8_t *ret = hci_event_command_complete_get_return_parameters(packet);
             uint8_t status = ret ? ret[0] : 0xff;
-            if (opcode == HCI_OPCODE_HCI_PERIODIC_INQUIRY_MODE && s_sync_window) {
-                ESP_LOGI(TAG, "Stopping periodic inquiry during Wiimote sync window");
+            if (opcode == HCI_OPCODE_HCI_PERIODIC_INQUIRY_MODE &&
+                (s_sync_window || s_gamepad_connecting || s_gamepad_connected)) {
+                ESP_LOGI(TAG, "Stopping periodic inquiry (sync=%d connecting=%d connected=%d)",
+                         s_sync_window, s_gamepad_connecting, s_gamepad_connected);
                 gap_inquiry_stop();
             } else if (opcode == HCI_OPCODE_HCI_WRITE_CURRENT_IAC_LAP_TWO_IACS) {
                 ESP_LOGI(TAG, "HCI_Write_Current_IAC_LAP status=0x%02x (LIAC 0x9E8B00 + GIAC 0x9E8B33)", status);
@@ -571,10 +607,12 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 if (!s_gamepad_connecting) {
                     s_gamepad_connecting = true;
                     memcpy(s_gamepad_addr, addr, 6);
-                    s_outbound_busy_until_us = esp_timer_get_time() + 8000000LL;
+                    /* Must exceed Bluepad32's HID_DEVICE_CONNECTION_TIMEOUT_MS (20s) so we never
+                     * resume periodic inquiry while HCI_Create_Connection is still paging. */
+                    s_outbound_busy_until_us = esp_timer_get_time() + 22000000LL;
                     if (!gap_event_inquiry_result_get_name_available(packet)) {
                         s_name_req_pending = true;
-                        s_name_req_cancel_at_us = esp_timer_get_time() + 3800000LL;
+                        s_name_req_cancel_at_us = esp_timer_get_time() + 1500000LL;
                     }
                     pause_gamepad_scanning();
                     ESP_LOGI(TAG, "Gamepad %02x:%02x:%02x:%02x:%02x:%02x discovered; paused inquiry & BLE scan for connection",
@@ -609,7 +647,7 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 hci_set_master_slave_policy(HCI_ROLE_MASTER);
                 s_gamepad_connecting = true;
                 memcpy(s_gamepad_addr, addr, 6);
-                s_outbound_busy_until_us = esp_timer_get_time() + 5000000LL;
+                s_outbound_busy_until_us = esp_timer_get_time() + 10000000LL;
                 pause_gamepad_scanning();
             }
             break;
@@ -630,9 +668,14 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                     packet[0] = HCI_EVENT_NOP;
                 }
             } else {
+                s_name_req_pending = false;
+                s_name_req_cancel_at_us = 0;
                 if (status == ERROR_CODE_SUCCESS) {
                     s_gamepad_handle = handle;
-                    s_outbound_busy_until_us = esp_timer_get_time() + 3000000LL;
+                    s_gamepad_connected = true;
+                    s_gamepad_connecting = false;
+                    s_outbound_busy_until_us = esp_timer_get_time() + 4000000LL;
+                    pause_gamepad_scanning();
                 } else {
                     s_gamepad_connecting = false;
                     s_gamepad_connected = false;
@@ -730,7 +773,7 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
         }
         case L2CAP_EVENT_CAN_SEND_NOW: {
             uint16_t cid = l2cap_event_can_send_now_get_local_cid(packet);
-            if (cid == s_cid_interrupt) {
+            if (cid == s_cid_interrupt || cid == s_cid_control) {
                 flush_reports();
             } else if (uni_bt_packet_handler != NULL) {
                 uni_bt_packet_handler(packet_type, channel, packet, size);
@@ -773,14 +816,12 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 wiimote_set_connected(false);
             } else if (s_gamepad_handle != HCI_CON_HANDLE_INVALID && handle == s_gamepad_handle) {
                 s_gamepad_handle = HCI_CON_HANDLE_INVALID;
-                if (s_gamepad_connected) {
+                s_outbound_busy_until_us = 0;
+                if (s_gamepad_connected || s_gamepad_connecting) {
                     s_gamepad_connected = false;
                     s_gamepad_connecting = false;
                     ESP_LOGI(TAG, "Gamepad disconnected (handle 0x%04x reason 0x%02x); resuming scan", handle, reason);
                     resume_gamepad_scanning();
-                } else if (s_gamepad_connecting) {
-                    /* Disconnected during SDP/handshake; allow 2s grace period for L2CAP reconnect */
-                    s_outbound_busy_until_us = esp_timer_get_time() + 2000000LL;
                 }
             }
             break;

@@ -492,22 +492,30 @@ void wiimote_proto_init(wiimote_proto_t *proto, wiimote_extension_t extension, u
 
 void wiimote_proto_set_button(wiimote_proto_t *proto, wiimote_button_t button, bool pressed)
 {
+    bool changed = false;
     if (button >= WIIMOTE_BUTTON_COUNT) {
         return;
     }
     if (button == WIIMOTE_BUTTON_NUNCHUK_C) {
+        changed = (proto->ext.nunchuk_c != pressed);
         proto->ext.nunchuk_c = pressed;
     } else if (button == WIIMOTE_BUTTON_NUNCHUK_Z) {
+        changed = (proto->ext.nunchuk_z != pressed);
         proto->ext.nunchuk_z = pressed;
     } else if (classic_button(button)) {
+        uint32_t prev = proto->ext.classic_pressed;
         if (pressed) proto->ext.classic_pressed |= (1u << button);
         else proto->ext.classic_pressed &= ~(1u << button);
-    } else if (pressed) {
-        proto->core_pressed |= (1u << button);
+        changed = (proto->ext.classic_pressed != prev);
     } else {
-        proto->core_pressed &= ~(1u << button);
+        uint32_t prev = proto->core_pressed;
+        if (pressed) proto->core_pressed |= (1u << button);
+        else proto->core_pressed &= ~(1u << button);
+        changed = (proto->core_pressed != prev);
     }
-    proto->have_last_payload = false;
+    if (changed) {
+        proto->have_last_payload = false;
+    }
 }
 
 static uint8_t clamp_u8(int value, int lo, int hi)
@@ -519,42 +527,91 @@ static uint8_t clamp_u8(int value, int lo, int hi)
 
 void wiimote_proto_set_axis_raw(wiimote_proto_t *proto, wiimote_axis_t axis, int value)
 {
+    uint8_t clamped;
+    bool changed = false;
     switch (axis) {
-    case WIIMOTE_AXIS_NUNCHUK_X: proto->ext.nunchuk_x = clamp_u8(value, 0, 255); break;
-    case WIIMOTE_AXIS_NUNCHUK_Y: proto->ext.nunchuk_y = clamp_u8(value, 0, 255); break;
-    case WIIMOTE_AXIS_CLASSIC_LX: proto->ext.classic_lx = clamp_u8(value, 0, 63); break;
-    case WIIMOTE_AXIS_CLASSIC_LY: proto->ext.classic_ly = clamp_u8(value, 0, 63); break;
-    case WIIMOTE_AXIS_CLASSIC_RX: proto->ext.classic_rx = clamp_u8(value, 0, 31); break;
-    case WIIMOTE_AXIS_CLASSIC_RY: proto->ext.classic_ry = clamp_u8(value, 0, 31); break;
-    case WIIMOTE_AXIS_CLASSIC_LT: proto->ext.classic_lt = clamp_u8(value, 0, 31); break;
-    case WIIMOTE_AXIS_CLASSIC_RT: proto->ext.classic_rt = clamp_u8(value, 0, 31); break;
-    default: break;
+    case WIIMOTE_AXIS_NUNCHUK_X:
+        clamped = clamp_u8(value, 0, 255);
+        changed = (proto->ext.nunchuk_x != clamped);
+        proto->ext.nunchuk_x = clamped;
+        break;
+    case WIIMOTE_AXIS_NUNCHUK_Y:
+        clamped = clamp_u8(value, 0, 255);
+        changed = (proto->ext.nunchuk_y != clamped);
+        proto->ext.nunchuk_y = clamped;
+        break;
+    case WIIMOTE_AXIS_CLASSIC_LX:
+        clamped = clamp_u8(value, 0, 63);
+        changed = (proto->ext.classic_lx != clamped);
+        proto->ext.classic_lx = clamped;
+        break;
+    case WIIMOTE_AXIS_CLASSIC_LY:
+        clamped = clamp_u8(value, 0, 63);
+        changed = (proto->ext.classic_ly != clamped);
+        proto->ext.classic_ly = clamped;
+        break;
+    case WIIMOTE_AXIS_CLASSIC_RX:
+        clamped = clamp_u8(value, 0, 31);
+        changed = (proto->ext.classic_rx != clamped);
+        proto->ext.classic_rx = clamped;
+        break;
+    case WIIMOTE_AXIS_CLASSIC_RY:
+        clamped = clamp_u8(value, 0, 31);
+        changed = (proto->ext.classic_ry != clamped);
+        proto->ext.classic_ry = clamped;
+        break;
+    case WIIMOTE_AXIS_CLASSIC_LT:
+        clamped = clamp_u8(value, 0, 31);
+        changed = (proto->ext.classic_lt != clamped);
+        proto->ext.classic_lt = clamped;
+        break;
+    case WIIMOTE_AXIS_CLASSIC_RT:
+        clamped = clamp_u8(value, 0, 31);
+        changed = (proto->ext.classic_rt != clamped);
+        proto->ext.classic_rt = clamped;
+        break;
+    default:
+        break;
     }
-    proto->have_last_payload = false;
+    if (changed) {
+        proto->have_last_payload = false;
+    }
 }
 
 void wiimote_proto_set_accel(wiimote_proto_t *proto, uint16_t x, uint16_t y, uint16_t z)
 {
-    proto->accel_x = x > 1023 ? 1023 : x;
-    proto->accel_y = y > 1023 ? 1023 : y;
-    proto->accel_z = z > 1023 ? 1023 : z;
-    proto->have_last_payload = false;
+    uint16_t cx = x > 1023 ? 1023 : x;
+    uint16_t cy = y > 1023 ? 1023 : y;
+    uint16_t cz = z > 1023 ? 1023 : z;
+    if (proto->accel_x != cx || proto->accel_y != cy || proto->accel_z != cz) {
+        proto->accel_x = cx;
+        proto->accel_y = cy;
+        proto->accel_z = cz;
+        proto->have_last_payload = false;
+    }
 }
 
 void wiimote_proto_set_nunchuk_accel(wiimote_proto_t *proto, uint16_t x, uint16_t y, uint16_t z)
 {
-    proto->ext.nunchuk_ax = x > 1023 ? 1023 : x;
-    proto->ext.nunchuk_ay = y > 1023 ? 1023 : y;
-    proto->ext.nunchuk_az = z > 1023 ? 1023 : z;
-    proto->have_last_payload = false;
+    uint16_t cx = x > 1023 ? 1023 : x;
+    uint16_t cy = y > 1023 ? 1023 : y;
+    uint16_t cz = z > 1023 ? 1023 : z;
+    if (proto->ext.nunchuk_ax != cx || proto->ext.nunchuk_ay != cy || proto->ext.nunchuk_az != cz) {
+        proto->ext.nunchuk_ax = cx;
+        proto->ext.nunchuk_ay = cy;
+        proto->ext.nunchuk_az = cz;
+        proto->have_last_payload = false;
+    }
 }
 
 void wiimote_proto_set_gyro(wiimote_proto_t *proto, int16_t pitch, int16_t roll, int16_t yaw)
 {
-    proto->ext.pitch_dps = pitch;
-    proto->ext.roll_dps = roll;
-    proto->ext.yaw_dps = yaw;
-    proto->have_last_payload = false;
+    if (proto->ext.pitch_dps != pitch || proto->ext.roll_dps != roll || proto->ext.yaw_dps != yaw) {
+        proto->ext.pitch_dps = pitch;
+        proto->ext.roll_dps = roll;
+        proto->ext.yaw_dps = yaw;
+        proto->have_last_payload = false;
+    }
 }
 
 void wiimote_proto_set_ir_dot(wiimote_proto_t *proto, int index, int x, int y, int size)
