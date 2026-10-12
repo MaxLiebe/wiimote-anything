@@ -99,8 +99,7 @@ static void adapter_on_init_complete(void)
 {
     ESP_LOGI(TAG, "Bluepad32 init complete; starting 20s Wiimote sync window (press red SYNC on Wii console)");
 
-    /* Disable Bluepad32 BLE configuration service and DualSense virtual touchpad device */
-    uni_bt_service_set_enabled(false);
+    /* Disable DualSense virtual touchpad device so each physical controller uses only one slot */
     uni_virtual_device_set_enabled(false);
 
     /* Initialize WiimoteAnything into the running BTstack */

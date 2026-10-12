@@ -433,7 +433,9 @@ static void flush_reports(void)
      *    link that starves the ESP32 Bluetooth Master piconet (gamepad link). */
     if (s_cid_interrupt != 0 && l2cap_can_send_packet_now(s_cid_interrupt)) {
         uint32_t min_interval_ms = 10;
-        if (s_outbound_busy_until_us > 0) {
+        if (s_gamepad_connecting) {
+            min_interval_ms = 50;
+        } else if (s_outbound_busy_until_us > 0) {
             min_interval_ms = 40;
         } else if (s_gamepad_handle != HCI_CON_HANDLE_INVALID) {
             /* Scatternet coexistence: send changed inputs at up to 40 Hz (25 ms)
@@ -552,18 +554,30 @@ static void report_timer_cb(btstack_timer_source_t *ts)
             s_name_req_cancel_at_us = 0;
             ESP_LOGW(TAG, "Cancelling slow HCI_Remote_Name_Request before L2CAP connect");
             hci_send_cmd(&hci_remote_name_request_cancel, s_gamepad_addr);
+            btstack_run_loop_set_timer(ts, 10);
+            btstack_run_loop_add_timer(ts);
+            return;
         }
     }
 
     if (s_outbound_busy_until_us > 0 && now >= s_outbound_busy_until_us) {
         s_outbound_busy_until_us = 0;
         if (s_gamepad_connecting) {
-            s_gamepad_connecting = false;
             if (s_gamepad_handle != HCI_CON_HANDLE_INVALID) {
+                s_gamepad_connecting = false;
                 s_gamepad_connected = true;
             } else {
-                ESP_LOGI(TAG, "Gamepad connection attempt timed out; resuming scan");
-                resume_gamepad_scanning();
+                if (hci_get_state() == HCI_STATE_WORKING && hci_can_send_command_packet_now()) {
+                    s_gamepad_connecting = false;
+                    ESP_LOGI(TAG, "Gamepad connection attempt timed out; cancelling page & resuming scan");
+                    hci_send_cmd(&hci_create_connection_cancel, s_gamepad_addr);
+                    resume_gamepad_scanning();
+                    btstack_run_loop_set_timer(ts, 10);
+                    btstack_run_loop_add_timer(ts);
+                    return;
+                }
+                /* Wait until next tick if command buffer is currently busy */
+                s_outbound_busy_until_us = now + 20000LL;
             }
         }
     }
@@ -607,12 +621,10 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 if (!s_gamepad_connecting) {
                     s_gamepad_connecting = true;
                     memcpy(s_gamepad_addr, addr, 6);
-                    /* Must exceed Bluepad32's HID_DEVICE_CONNECTION_TIMEOUT_MS (20s) so we never
-                     * resume periodic inquiry while HCI_Create_Connection is still paging. */
-                    s_outbound_busy_until_us = esp_timer_get_time() + 22000000LL;
+                    s_outbound_busy_until_us = esp_timer_get_time() + 14000000LL;
                     if (!gap_event_inquiry_result_get_name_available(packet)) {
                         s_name_req_pending = true;
-                        s_name_req_cancel_at_us = esp_timer_get_time() + 1500000LL;
+                        s_name_req_cancel_at_us = esp_timer_get_time() + 3800000LL;
                     }
                     pause_gamepad_scanning();
                     ESP_LOGI(TAG, "Gamepad %02x:%02x:%02x:%02x:%02x:%02x discovered; paused inquiry & BLE scan for connection",
@@ -744,6 +756,9 @@ static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_
                 gap_connectable_control(0);
                 gap_set_page_scan_activity(0x0800, 0x0012);
                 gap_inquiry_set_scan_activity(0x0800, 0x0012);
+                /* Set page timeout to 6.4s (0x2800 slots) instead of BTstack's 15.36s default
+                 * so a missed page fails and cleans up well before Bluepad32's 20s timeout. */
+                gap_set_page_timeout(0x2800);
                 if (uni_bt_packet_handler != NULL) {
                     /* Reduce BLE scan duty cycle from 100% (48/48) to 12.5% (48/384)
                      * so BLE scanning does not starve BR/EDR inquiry & paging while connected to Wii. */
