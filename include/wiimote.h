@@ -117,6 +117,11 @@ bool wiimote_is_syncing(void);
  * ESP_ERR_NOT_FOUND when nothing was synced yet. BTstack backend only.
  */
 esp_err_t wiimote_connect(void);
+/**
+ * A page to the console (wiimote_connect) or an incoming console connection is
+ * in progress. Calling wiimote_connect() meanwhile does nothing.
+ */
+bool wiimote_is_connecting(void);
 /** Drop the console link (it can reconnect later). */
 esp_err_t wiimote_disconnect(void);
 /** A console has been synced and is remembered across reboots. */

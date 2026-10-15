@@ -77,7 +77,7 @@ arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 examples/SerialRemot
 ## Sync, reconnect, forget
 
 - `wiimote_sync()` is the red SYNC button on the back of a remote: discoverable for 20 s. Press SYNC on the Wii. The console that pairs is stored (BTstack TLV / NVS) together with its link key.
-- `wiimote_connect()` is pressing a button on a bonded remote: page the stored console and open the HID channels. Works after a reboot without syncing again. `ESP_ERR_NOT_FOUND` if nothing was synced. BTstack backend only.
+- `wiimote_connect()` is pressing a button on a bonded remote: page the stored console and open the HID channels. Works after a reboot without syncing again. Like a real remote it does not authenticate the console itself; the console (system menu or libogc homebrew) does that with the stored link key. `wiimote_is_connecting()` is true while a page is under way. `ESP_ERR_NOT_FOUND` if nothing was synced. BTstack backend only.
 - `wiimote_has_paired_host()`, `wiimote_forget_host()`, `wiimote_disconnect()`, `wiimote_is_syncing()`.
 - `callbacks.sync_changed(active)` reports the sync window opening and closing.
 

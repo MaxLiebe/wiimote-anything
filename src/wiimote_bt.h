@@ -29,6 +29,7 @@ esp_err_t wiimote_bt_forget_host(void);
 bool wiimote_bt_has_host(void);
 void wiimote_bt_send_now(void);
 bool wiimote_bt_link_is_master(void);
+bool wiimote_bt_is_connecting(void);
 uint8_t wiimote_bt_last_disconnect_reason(void);
 
 esp_err_t wiimote_btstack_register_services(void);

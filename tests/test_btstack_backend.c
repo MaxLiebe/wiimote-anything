@@ -134,7 +134,9 @@ static hci_con_handle_t g_security_handle;
 static gap_security_level_t g_link_level = LEVEL_0;
 uint8_t gap_request_role(const bd_addr_t addr, hci_role_t role) { (void)addr; (void)role; g_role_requests++; return 0; }
 void gap_request_security_level(hci_con_handle_t h, gap_security_level_t l) { (void)l; g_security_handle = h; g_security_requests++; }
-gap_security_level_t gap_get_security_level(void) { return LEVEL_2; }
+static gap_security_level_t g_gap_level = LEVEL_2, g_level_at_create = LEVEL_2;
+gap_security_level_t gap_get_security_level(void) { return g_gap_level; }
+void gap_set_security_level(gap_security_level_t l) { g_gap_level = l; }
 gap_security_level_t gap_security_level(hci_con_handle_t h) { (void)h; return g_link_level; }
 gap_connection_type_t gap_get_connection_type(hci_con_handle_t h) { (void)h; return GAP_CONNECTION_ACL; }
 static uint16_t g_page_timeout;
@@ -159,6 +161,7 @@ static int g_created;
 uint8_t l2cap_create_channel(btstack_packet_handler_t h, bd_addr_t a, uint16_t psm, uint16_t mtu, uint16_t *cid)
 {
     (void)h; (void)a; (void)mtu;
+    g_level_at_create = g_gap_level;
     *cid = g_next_cid++;
     g_created_psm[g_created++ & 3] = psm;
     return 0;
@@ -599,13 +602,13 @@ static void test_gamepad_passthrough(void)
     ev_disconnect(0x0082);
     CHECK(g_connected);
 
-    /* A brand-new gamepad (no key) is accepted as slave, and asked to switch
-     * only when the application tunes it. */
+    /* A brand-new gamepad (no key) outside the sync window: become master,
+     * as Bluepad32 would. */
     g_have_key = false;
     {
         static const bd_addr_t NEWPAD = {0x77, 0x66, 0x55, 0x44, 0x33, 0x22};
         ev = ev_conn_request(NEWPAD, 0x000508);
-        CHECK(g_policy == HCI_ROLE_SLAVE);
+        CHECK(g_policy == HCI_ROLE_MASTER);
         CHECK(ev == HCI_EVENT_CONNECTION_REQUEST);
         ev_conn_complete(NEWPAD, 0x0083, 0);
         CHECK(g_role_requests == 0);
@@ -645,6 +648,9 @@ static void test_wii_disconnect_and_reconnect(void)
     CHECK(wiimote_bt_connect() == ESP_OK);
     run_main_thread();
     CHECK(g_created == 1 && g_created_psm[0] == WM_PSM_CONTROL);
+    CHECK(g_level_at_create == LEVEL_0);             /* the console authenticates, not us */
+    CHECK(g_gap_level == LEVEL_2);                   /* host stack level restored */
+    CHECK(wiimote_bt_is_connecting());
     CHECK(!g_allow_role_switch);                     /* page the Wii as master only */
     {
         uint16_t ctrl = s_cid_control;

@@ -357,6 +357,22 @@ static void restore_page_settings(void)
     }
 }
 
+/* Open a channel to the console without authenticating first. A real remote
+ * never starts authentication: the console does (the system menu and libogc
+ * both request it as soon as the ACL is up). BTstack's outgoing channels use
+ * the global GAP level (2 by default, and Bluepad32 sets 2), which would make
+ * us authenticate and encrypt before HID control opens: slower, and it
+ * collides with the console's own authentication in homebrew (libogc). */
+static uint8_t create_console_channel(uint16_t psm, uint16_t *cid)
+{
+    gap_security_level_t saved = gap_get_security_level();
+    uint8_t status;
+    gap_set_security_level(LEVEL_0);
+    status = l2cap_create_channel(wm_l2cap_handler, s_link_addr, psm, WM_L2CAP_MTU, cid);
+    gap_set_security_level(saved);
+    return status;
+}
+
 static void release_link(void)
 {
     bool was_up = s_link_up;
@@ -654,11 +670,10 @@ static int connection_filter(bd_addr_t addr, hci_link_type_t link_type)
         bool known_console = s_have_host && addr_eq(addr, s_host_addr);
         bool has_key = gap_get_link_key_for_bd_addr(addr, key, &type);
         /* A console pages a remote and stays master, exactly like with a real
-         * Wiimote. Bonded gamepads that reconnect get "become master" so the
-         * ESP32 is master of its own piconet. Unknown devices are accepted
-         * without a role switch; the application asks for one once the
-         * gamepad is set up (wiimote_btstack_tune_link). */
-        bool slave = (s_fallback == NULL) || known_console || !has_key;
+         * Wiimote. Everything else gets "become master", as Bluepad32 asks
+         * for, so the ESP32 is master of its own piconet. Unknown devices
+         * during the sync window may be the console: no role switch then. */
+        bool slave = (s_fallback == NULL) || known_console || (!has_key && s_sync_active);
         hci_set_master_slave_policy(slave ? HCI_ROLE_SLAVE : HCI_ROLE_MASTER);
     }
     return 1;
@@ -904,7 +919,7 @@ static void start_outgoing(void)
         gap_set_page_timeout(WM_PAGE_TIMEOUT_CONSOLE);
         s_restore_page_timeout = true;
     }
-    status = l2cap_create_channel(wm_l2cap_handler, s_host_addr, WM_PSM_CONTROL, WM_L2CAP_MTU, &s_cid_control);
+    status = create_console_channel(WM_PSM_CONTROL, &s_cid_control);
     if (status != ERROR_CODE_SUCCESS) {
         ESP_LOGW(TAG, "Paging console failed to start (0x%02x)", status);
         s_cid_control = 0;
@@ -1085,8 +1100,7 @@ static void wm_l2cap_handler(uint8_t packet_type, uint16_t channel, uint8_t *pac
         ESP_LOGI(TAG, "Console channel PSM 0x%04x open (cid 0x%04x)", psm, cid);
         if (s_link_outgoing && cid == s_cid_control && s_cid_interrupt == 0) {
             /* A real remote opens control first, then interrupt. */
-            uint8_t st = l2cap_create_channel(wm_l2cap_handler, s_link_addr, WM_PSM_INTERRUPT, WM_L2CAP_MTU,
-                                              &s_cid_interrupt);
+            uint8_t st = create_console_channel(WM_PSM_INTERRUPT, &s_cid_interrupt);
             if (st != ERROR_CODE_SUCCESS) {
                 ESP_LOGW(TAG, "Opening interrupt channel failed (0x%02x)", st);
                 s_cid_interrupt = 0;
@@ -1218,6 +1232,8 @@ static void wm_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             if (s_fallback != NULL) {
                 packet[0] = HCI_EVENT_NOP;
             }
+        } else {
+            ESP_LOGI(TAG, "Incoming ACL from %s (cod 0x%06lx): host stack", bd_addr_to_str(addr), (unsigned long)cod);
         }
         break;
     }
@@ -1589,6 +1605,11 @@ void wiimote_bt_send_now(void)
     if (s_link_up) {
         post_request(WM_REQ_FLUSH);
     }
+}
+
+bool wiimote_bt_is_connecting(void)
+{
+    return (s_link_claimed && !s_link_up) || (s_requests & WM_REQ_CONNECT) != 0;
 }
 
 bool wiimote_bt_link_is_master(void)

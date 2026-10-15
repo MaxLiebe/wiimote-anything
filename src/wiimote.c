@@ -363,6 +363,11 @@ void wiimote_send_now(void)
     }
 }
 
+bool wiimote_is_connecting(void)
+{
+    return s_proto != NULL && wiimote_bt_is_connecting();
+}
+
 bool wiimote_link_is_master(void)
 {
     return s_proto != NULL && wiimote_bt_link_is_master();

@@ -48,6 +48,7 @@ public:
     bool syncing() const;
     /** Reconnect to the console synced before (BTstack backend only). */
     bool connect();
+    bool connecting() const;
     bool disconnect();
     bool hasPairedHost() const;
     bool forgetHost();

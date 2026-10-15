@@ -103,6 +103,11 @@ bool Wiimote::connect()
     return wiimote_connect() == ESP_OK;
 }
 
+bool Wiimote::connecting() const
+{
+    return wiimote_is_connecting();
+}
+
 bool Wiimote::disconnect()
 {
     return wiimote_disconnect() == ESP_OK;

@@ -1683,6 +1683,11 @@ void wiimote_bt_send_now(void)
 {
 }
 
+bool wiimote_bt_is_connecting(void)
+{
+    return false;
+}
+
 bool wiimote_bt_link_is_master(void)
 {
     return false;
