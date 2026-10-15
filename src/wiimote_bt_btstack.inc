@@ -66,6 +66,11 @@ static const char *TAG = "wiimote_bt";
 #define WM_COD 0x002504u
 #define WM_COD_MAJOR_MASK 0x001f00u
 #define WM_COD_MAJOR_PERIPHERAL 0x000500u
+#define WM_COD_WII 0x000448u
+/* Page timeout for our own page to the console (5.12 s), and BTstack's
+ * default, which the host stack uses for gamepads (15.36 s). */
+#define WM_PAGE_TIMEOUT_CONSOLE 0x2000
+#define WM_PAGE_TIMEOUT_DEFAULT 0x6000
 
 static const char k_local_name[] = "Nintendo RVL-CNT-01";
 
@@ -135,12 +140,16 @@ static bool s_link_master; /* our role on the console link, from ROLE_CHANGE */
 static btstack_timer_source_t s_connect_watchdog;
 #define WM_CONNECT_TIMEOUT_MS 15000
 
-/* Role chosen by connection_filter() for the most recent incoming ACL. */
-static bool s_filter_chose_slave;
-static bd_addr_t s_filter_addr;
-/* A gamepad accepted as slave because it had no link key yet. */
-static bool s_role_fix_pending;
-static bd_addr_t s_role_fix_addr;
+/* Incoming host-stack (gamepad) channels held back until the link reaches the
+ * host stack's GAP security level, as its own PSM services would have done.
+ * Our PSM services are level 0 because the console must never be challenged. */
+#define WM_HELD_MAX 4
+static struct {
+    uint16_t cid;
+    hci_con_handle_t handle;
+    uint16_t size;
+    uint8_t packet[24];
+} s_held[WM_HELD_MAX];
 
 static bool s_sync_active;
 
@@ -185,6 +194,8 @@ static uint8_t s_qos_inflight_type;
 static uint8_t s_last_disconnect_reason;
 /* Role switch was turned off for our page to the console; turn it back on. */
 static bool s_restore_role_switch;
+/* The page timeout was shortened for our page to the console; restore it. */
+static bool s_restore_page_timeout;
 
 /* Requests posted from other tasks; executed on the BTstack thread. */
 #define WM_REQ_SYNC (1u << 0)
@@ -279,9 +290,15 @@ static bool is_console(const bd_addr_t addr, uint32_t cod, bool cod_known)
     if (!cod_known) {
         return false;
     }
-    /* Gamepads, keyboards, Wii remotes: major class "peripheral". The Wii is
-     * Audio/Video "gaming/toy" (0x000448); Dolphin hosts are computers. */
-    return (cod & WM_COD_MAJOR_MASK) != WM_COD_MAJOR_PERIPHERAL;
+    /* The Wii is Audio/Video "gaming/toy" (0x000448). */
+    if ((cod & 0xffffffu) == WM_COD_WII) {
+        return true;
+    }
+    /* Other non-peripheral hosts (Dolphin on a PC, a Wii U) only while the
+     * sync window is open: a console never pages a remote it has not just
+     * found. Outside the window everything unknown belongs to the host stack,
+     * whatever class of device a gamepad claims to be. */
+    return s_sync_active && (cod & WM_COD_MAJOR_MASK) != WM_COD_MAJOR_PERIPHERAL;
 }
 
 static bool is_console_link_addr(const bd_addr_t addr)
@@ -326,6 +343,20 @@ static void report_timer_stop(void)
     btstack_run_loop_remove_timer(&s_report_timer);
 }
 
+/* Undo the radio settings changed for our page to the console, so the host
+ * stack pages gamepads the way it always does. */
+static void restore_page_settings(void)
+{
+    if (s_restore_role_switch) {
+        s_restore_role_switch = false;
+        gap_set_allow_role_switch(true);
+    }
+    if (s_restore_page_timeout) {
+        s_restore_page_timeout = false;
+        gap_set_page_timeout(WM_PAGE_TIMEOUT_DEFAULT);
+    }
+}
+
 static void release_link(void)
 {
     bool was_up = s_link_up;
@@ -342,10 +373,7 @@ static void release_link(void)
     s_have_rumble = false;
     report_timer_stop();
     btstack_run_loop_remove_timer(&s_connect_watchdog);
-    if (s_restore_role_switch) {
-        s_restore_role_switch = false;
-        gap_set_allow_role_switch(true);
-    }
+    restore_page_settings();
     if (was_up) {
         ESP_LOGI(TAG, "Console link down");
     }
@@ -586,9 +614,12 @@ static void apply_identity(void)
     gap_set_class_of_device(WM_COD);
     gap_set_allow_role_switch(true);
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
-    /* 5.12 s instead of 15.36 s: a page to a console that is still booting a
-     * game fails quickly and can be retried. */
-    gap_set_page_timeout(0x2000);
+    if (s_fallback == NULL) {
+        /* 5.12 s instead of 15.36 s: a page to a console that is still
+         * booting a game fails quickly and can be retried. Shared with a host
+         * stack, this is set only around our own page (start_outgoing). */
+        gap_set_page_timeout(WM_PAGE_TIMEOUT_CONSOLE);
+    }
     gap_connectable_control(1);
 }
 
@@ -625,12 +656,10 @@ static int connection_filter(bd_addr_t addr, hci_link_type_t link_type)
         /* A console pages a remote and stays master, exactly like with a real
          * Wiimote. Bonded gamepads that reconnect get "become master" so the
          * ESP32 is master of its own piconet. Unknown devices are accepted
-         * without a role switch; if they turn out to be a gamepad, a switch
-         * is requested once the link is up. */
+         * without a role switch; the application asks for one once the
+         * gamepad is set up (wiimote_btstack_tune_link). */
         bool slave = (s_fallback == NULL) || known_console || !has_key;
         hci_set_master_slave_policy(slave ? HCI_ROLE_SLAVE : HCI_ROLE_MASTER);
-        s_filter_chose_slave = slave;
-        memcpy(s_filter_addr, addr, BD_ADDR_LEN);
     }
     return 1;
 }
@@ -872,12 +901,15 @@ static void start_outgoing(void)
          * the ESP32 stays master of both, one piconet. */
         gap_set_allow_role_switch(false);
         s_restore_role_switch = true;
+        gap_set_page_timeout(WM_PAGE_TIMEOUT_CONSOLE);
+        s_restore_page_timeout = true;
     }
     status = l2cap_create_channel(wm_l2cap_handler, s_host_addr, WM_PSM_CONTROL, WM_L2CAP_MTU, &s_cid_control);
     if (status != ERROR_CODE_SUCCESS) {
         ESP_LOGW(TAG, "Paging console failed to start (0x%02x)", status);
         s_cid_control = 0;
         s_link_claimed = false;
+        restore_page_settings();
         return;
     }
     ESP_LOGI(TAG, "Paging console %s", bd_addr_to_str(s_host_addr));
@@ -918,6 +950,59 @@ static void forward(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint
     }
 }
 
+/* Hold an incoming host-stack channel until its link is as secure as the host
+ * stack requires (Bluepad32: level 2). Stock Bluepad32 registers PSM 0x11/0x13
+ * at that level, so L2CAP authenticates and encrypts before the channel is
+ * offered; pads in Switch mode (Switch Pro, 8BitDo) only connect that way.
+ * Returns false when the link is already secure enough (forward now). */
+static bool hold_until_secure(uint16_t channel, hci_con_handle_t handle, uint8_t *packet, uint16_t size)
+{
+    gap_security_level_t need = gap_get_security_level();
+    int i;
+    if (need == LEVEL_0 || gap_security_level(handle) >= need || size > sizeof(s_held[0].packet)) {
+        return false;
+    }
+    for (i = 0; i < WM_HELD_MAX; i++) {
+        if (s_held[i].cid == 0) {
+            break;
+        }
+    }
+    if (i == WM_HELD_MAX) {
+        return false;
+    }
+    s_held[i].cid = channel;
+    s_held[i].handle = handle;
+    s_held[i].size = size;
+    memcpy(s_held[i].packet, packet, size);
+    /* May report GAP_EVENT_SECURITY_LEVEL right away (release_held). */
+    gap_request_security_level(handle, need);
+    return true;
+}
+
+/* GAP_EVENT_SECURITY_LEVEL, or level < 0 when the link went down. Offer the
+ * held channels to the host stack, or refuse them as L2CAP would have. */
+static void release_held(hci_con_handle_t handle, int level)
+{
+    gap_security_level_t need = gap_get_security_level();
+    for (int i = 0; i < WM_HELD_MAX; i++) {
+        if (s_held[i].cid == 0 || s_held[i].handle != handle) {
+            continue;
+        }
+        uint16_t cid = s_held[i].cid;
+        s_held[i].cid = 0;
+        if (level < 0) {
+            continue; /* ACL gone; L2CAP already dropped the channel. */
+        }
+        if (level >= (int)need) {
+            forward(HCI_EVENT_PACKET, cid, s_held[i].packet, s_held[i].size);
+        } else {
+            ESP_LOGW(TAG, "Link 0x%04x stayed at security level %d (need %d); refusing its channel", handle, level,
+                     (int)need);
+            l2cap_decline_connection(cid);
+        }
+    }
+}
+
 static bool is_our_cid(uint16_t cid)
 {
     return cid != 0 && (cid == s_cid_control || cid == s_cid_interrupt);
@@ -946,10 +1031,10 @@ static void wm_l2cap_handler(uint8_t packet_type, uint16_t channel, uint8_t *pac
         hci_con_handle_t handle = l2cap_event_incoming_connection_get_handle(packet);
         l2cap_event_incoming_connection_get_address(packet, addr);
         if (!is_console_link_addr(addr) && !is_console(addr, 0, false)) {
-            if (s_fallback != NULL) {
-                forward(packet_type, channel, packet, size);
-            } else {
+            if (s_fallback == NULL) {
                 l2cap_decline_connection(cid);
+            } else if (!hold_until_secure(channel, handle, packet, size)) {
+                forward(packet_type, channel, packet, size);
             }
             return;
         }
@@ -1133,9 +1218,6 @@ static void wm_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             if (s_fallback != NULL) {
                 packet[0] = HCI_EVENT_NOP;
             }
-        } else if (s_fallback != NULL && s_filter_chose_slave && addr_eq(addr, s_filter_addr)) {
-            s_role_fix_pending = true;
-            memcpy(s_role_fix_addr, addr, BD_ADDR_LEN);
         }
         break;
     }
@@ -1146,10 +1228,7 @@ static void wm_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
         hci_con_handle_t handle = hci_event_connection_complete_get_connection_handle(packet);
         hci_event_connection_complete_get_bd_addr(packet, addr);
         if (is_console_link_addr(addr)) {
-            if (s_restore_role_switch) {
-                s_restore_role_switch = false;
-                gap_set_allow_role_switch(true);
-            }
+            restore_page_settings();
             if (status == ERROR_CODE_SUCCESS) {
                 s_link_handle = handle;
                 ESP_LOGI(TAG, "ACL to console up (handle 0x%04x, ESP32 is %s)", handle,
@@ -1170,20 +1249,11 @@ static void wm_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                     release_link();
                 }
             }
-        } else if (s_role_fix_pending && addr_eq(addr, s_role_fix_addr)) {
-            s_role_fix_pending = false;
-            if (status == ERROR_CODE_SUCCESS) {
-                gap_request_role(addr, HCI_ROLE_MASTER);
-            }
         }
-        if (status == ERROR_CODE_SUCCESS && s_fallback != NULL && !is_console_link_addr(addr)) {
-            /* Gamepad link: our PSM services are level 0 so the console is
-             * never challenged. Ask gamepads for what the host stack would. */
-            gap_request_security_level(handle, LEVEL_2);
-            /* Gamepad: role switch allowed, sniff not (latency). */
-            queue_link_policy(handle, LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
-            queue_qos(handle, WM_QOS_GUARANTEED);
-        }
+        /* Gamepad links are left alone while the host stack sets them up
+         * (name request, SDP, pairing): extra HCI traffic there makes some
+         * pads give up. The application tunes them once they are ready
+         * (wiimote_btstack_tune_link). */
         break;
     }
 
@@ -1239,8 +1309,13 @@ static void wm_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
         break;
     }
 
+    case GAP_EVENT_SECURITY_LEVEL:
+        release_held(gap_event_security_level_get_handle(packet), gap_event_security_level_get_security_level(packet));
+        break;
+
     case HCI_EVENT_DISCONNECTION_COMPLETE: {
         hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
+        release_held(handle, -1);
         if (!(s_link_claimed && handle == s_link_handle)) {
             /* Not the console: say why, it tells radio trouble (0x08 timeout)
              * from the gamepad hanging up (0x13) or us closing it (0x16). */
@@ -1391,6 +1466,23 @@ static void standalone_run_loop_task(void *arg)
 void wiimote_btstack_set_fallback_handler(btstack_packet_handler_t handler)
 {
     s_fallback = handler;
+}
+
+void wiimote_btstack_tune_link(hci_con_handle_t handle, const bd_addr_t addr)
+{
+    if (handle == HCI_CON_HANDLE_INVALID || gap_get_connection_type(handle) != GAP_CONNECTION_ACL ||
+        (s_link_claimed && handle == s_link_handle)) {
+        return;
+    }
+    /* Master of every link: as slave on one link and master on another the
+     * ESP32 controller starves both. */
+    if (gap_get_role(handle) == HCI_ROLE_SLAVE) {
+        gap_request_role(addr, HCI_ROLE_MASTER);
+    }
+    /* Role switch allowed, sniff not (sniff adds latency to every report),
+     * and a short poll interval. */
+    queue_link_policy(handle, LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
+    queue_qos(handle, WM_QOS_GUARANTEED);
 }
 
 void wiimote_bt_set_external_stack(bool external)

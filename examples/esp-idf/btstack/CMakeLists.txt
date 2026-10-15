@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
-set(WIIMOTE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
+set(WIIMOTE_ROOT "${CMAKE_CURRENT_LIST_DIR}/../../..")
 
 if(NOT DEFINED ENV{BTSTACK_ROOT})
     if(EXISTS "${WIIMOTE_ROOT}/components/bluepad32/external/btstack")

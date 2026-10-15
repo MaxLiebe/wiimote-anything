@@ -3,8 +3,8 @@
 WiimoteAnything starts and owns BTstack (no Bluepad32). Buttons on GPIO 4 (A)
 and 5 (B) to GND, LED on GPIO 26, rumble on GPIO 25.
 
-BTstack is taken from Bluepad32's checkout if `components/bluepad32` exists
-next to the library, from `components/btstack`, or from `$BTSTACK_ROOT`.
+BTstack is taken from a recursive Bluepad32 clone in the library's
+`components/bluepad32`, from `components/btstack`, or from `$BTSTACK_ROOT`.
 
 ```bash
 idf.py set-target esp32

@@ -273,6 +273,8 @@ esp_err_t wiimote_init(const wiimote_config_t *config)
     }
     s_proto = (wiimote_proto_t *)calloc(1, sizeof(*s_proto));
     if (s_proto == NULL) {
+        vSemaphoreDelete(s_lock);
+        s_lock = NULL;
         return ESP_ERR_NO_MEM;
     }
     battery = config->battery ? config->battery : 0xc0;
@@ -285,7 +287,12 @@ esp_err_t wiimote_init(const wiimote_config_t *config)
     wiimote_bt_set_external_stack(config->external_stack);
     err = wiimote_bt_start();
     if (err != ESP_OK) {
+        /* Nothing runs yet: release the state so wiimote_init() can retry. */
         ESP_LOGE(TAG, "Bluetooth start failed: %s", esp_err_to_name(err));
+        free(s_proto);
+        s_proto = NULL;
+        vSemaphoreDelete(s_lock);
+        s_lock = NULL;
         return err;
     }
     if (xTaskCreate(wiimote_task, "wiimote", 6144, NULL, 5, &s_task) != pdPASS) {

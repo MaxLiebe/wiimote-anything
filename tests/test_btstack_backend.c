@@ -130,9 +130,15 @@ int gap_pin_code_response_binary(const bd_addr_t addr, const uint8_t *pin, uint8
     return 0;
 }
 static int g_role_requests, g_security_requests, g_disconnects;
+static hci_con_handle_t g_security_handle;
+static gap_security_level_t g_link_level = LEVEL_0;
 uint8_t gap_request_role(const bd_addr_t addr, hci_role_t role) { (void)addr; (void)role; g_role_requests++; return 0; }
-void gap_request_security_level(hci_con_handle_t h, gap_security_level_t l) { (void)h; (void)l; g_security_requests++; }
-void gap_set_page_timeout(uint16_t t) { (void)t; }
+void gap_request_security_level(hci_con_handle_t h, gap_security_level_t l) { (void)l; g_security_handle = h; g_security_requests++; }
+gap_security_level_t gap_get_security_level(void) { return LEVEL_2; }
+gap_security_level_t gap_security_level(hci_con_handle_t h) { (void)h; return g_link_level; }
+gap_connection_type_t gap_get_connection_type(hci_con_handle_t h) { (void)h; return GAP_CONNECTION_ACL; }
+static uint16_t g_page_timeout;
+void gap_set_page_timeout(uint16_t t) { g_page_timeout = t; }
 uint8_t gap_disconnect(hci_con_handle_t h) { (void)h; g_disconnects++; return 0; }
 
 /* L2CAP */
@@ -341,6 +347,15 @@ static void l2cap_opened(const bd_addr_t a, uint16_t handle, uint16_t psm, uint1
     wm_l2cap_handler(HCI_EVENT_PACKET, cid, ev, sizeof(ev));
 }
 
+static void ev_security_level(uint16_t handle, uint8_t level)
+{
+    uint8_t ev[6] = {GAP_EVENT_SECURITY_LEVEL, 4};
+    little_endian_store_16(ev, 2, handle);
+    ev[4] = level;
+    ev[5] = 0;
+    emit_hci(ev, sizeof(ev));
+}
+
 static void l2cap_closed(uint16_t cid)
 {
     uint8_t ev[4] = {L2CAP_EVENT_CHANNEL_CLOSED, 2};
@@ -531,7 +546,32 @@ static void test_gamepad_passthrough(void)
     CHECK(g_policy == HCI_ROLE_MASTER);
     ev = ev_conn_complete(PAD, 0x0082, 0);
     CHECK(ev == HCI_EVENT_CONNECTION_COMPLETE);
-    CHECK(g_security_requests == sec_before + 1);
+    /* Left alone while Bluepad32 sets it up: no auth, role, policy or QoS. */
+    CHECK(g_security_requests == sec_before);
+    CHECK(g_role_requests == 0);
+    CHECK(s_qos_inflight_handle == HCI_CON_HANDLE_INVALID && s_policy_count == 0);
+
+    ev = ev_pin_request(PAD);
+    CHECK(ev == HCI_EVENT_PIN_CODE_REQUEST);         /* Bluepad32 answers this one */
+
+    /* The pad opens HID control before the link is encrypted: held back
+     * until it reaches Bluepad32's level 2, like Bluepad32's own service. */
+    g_link_level = LEVEL_0;
+    l2cap_incoming(PAD, 0x0082, WM_PSM_CONTROL, 0x50);
+    CHECK(g_fallback_calls == 0);
+    CHECK(g_security_requests == sec_before + 1 && g_security_handle == 0x0082);
+    ev_security_level(0x0082, LEVEL_2);
+    CHECK(g_fallback_calls == 1 && g_fallback_last_event == L2CAP_EVENT_INCOMING_CONNECTION);
+    /* Already secure: interrupt goes straight through. */
+    g_link_level = LEVEL_2;
+    l2cap_incoming(PAD, 0x0082, WM_PSM_INTERRUPT, 0x51);
+    CHECK(g_fallback_calls == 2 && g_security_requests == sec_before + 1);
+    g_fallback_calls = 1;
+    g_link_level = LEVEL_0;
+
+    /* Ready: the application tunes the link. */
+    g_role = HCI_ROLE_MASTER;
+    wiimote_btstack_tune_link(0x0082, PAD);
     CHECK(g_role_requests == 0);
     /* Short poll interval asked for the gamepad link. */
     CHECK(s_qos_inflight_handle == 0x0082 && s_qos_inflight_type == WM_QOS_GUARANTEED);
@@ -546,11 +586,6 @@ static void test_gamepad_passthrough(void)
         CHECK(g_cmds_sent == c2 + 1 && s_qos_inflight_handle == HCI_CON_HANDLE_INVALID);
     }
 
-    ev = ev_pin_request(PAD);
-    CHECK(ev == HCI_EVENT_PIN_CODE_REQUEST);         /* Bluepad32 answers this one */
-
-    l2cap_incoming(PAD, 0x0082, WM_PSM_CONTROL, 0x50);
-    CHECK(g_fallback_calls == 1 && g_fallback_last_event == L2CAP_EVENT_INCOMING_CONNECTION);
     l2cap_opened(PAD, 0x0082, WM_PSM_CONTROL, 0x50, 0);
     CHECK(g_fallback_calls == 2);
     {
@@ -564,7 +599,8 @@ static void test_gamepad_passthrough(void)
     ev_disconnect(0x0082);
     CHECK(g_connected);
 
-    /* A brand-new gamepad (no key) is accepted as slave, then asked to switch. */
+    /* A brand-new gamepad (no key) is accepted as slave, and asked to switch
+     * only when the application tunes it. */
     g_have_key = false;
     {
         static const bd_addr_t NEWPAD = {0x77, 0x66, 0x55, 0x44, 0x33, 0x22};
@@ -572,9 +608,28 @@ static void test_gamepad_passthrough(void)
         CHECK(g_policy == HCI_ROLE_SLAVE);
         CHECK(ev == HCI_EVENT_CONNECTION_REQUEST);
         ev_conn_complete(NEWPAD, 0x0083, 0);
+        CHECK(g_role_requests == 0);
+        /* A channel held for security is dropped with the link. */
+        int calls = g_fallback_calls;
+        l2cap_incoming(NEWPAD, 0x0083, WM_PSM_CONTROL, 0x52);
+        ev_disconnect(0x0083);
+        ev_security_level(0x0083, LEVEL_2);
+        CHECK(g_fallback_calls == calls);
+        /* Tuning a slave link asks for master. */
+        g_role = HCI_ROLE_SLAVE;
+        wiimote_btstack_tune_link(0x0083, NEWPAD);
         CHECK(g_role_requests == 1);
     }
     g_role_requests = 0;
+
+    /* A gamepad with an odd (non-peripheral) class of device outside the
+     * sync window still belongs to Bluepad32. */
+    {
+        static const bd_addr_t ODDPAD = {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc};
+        ev = ev_conn_request(ODDPAD, 0x000104);
+        CHECK(ev == HCI_EVENT_CONNECTION_REQUEST);
+        CHECK(!(s_link_claimed && memcmp(s_link_addr, ODDPAD, 6) == 0));
+    }
 }
 
 static void test_wii_disconnect_and_reconnect(void)
@@ -664,8 +719,10 @@ static void test_connect_watchdog(void)
     CHECK(wiimote_bt_connect() == ESP_OK);
     run_main_thread();
     CHECK(g_created == 1 && s_link_claimed);
+    CHECK(g_page_timeout == WM_PAGE_TIMEOUT_CONSOLE);  /* short page for the Wii */
     /* It works this time; the watchdog is disarmed once the link is up. */
     ev_conn_complete(WII, 0x0092, 0);
+    CHECK(g_page_timeout == WM_PAGE_TIMEOUT_DEFAULT);  /* gamepads page as usual */
     l2cap_opened(WII, 0x0092, WM_PSM_CONTROL, s_cid_control, 0);
     l2cap_opened(WII, 0x0092, WM_PSM_INTERRUPT, s_cid_interrupt, 0);
     CHECK(g_connected && !g_watchdog_armed);
