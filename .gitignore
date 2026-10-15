@@ -8,3 +8,4 @@ tests/test_proto
 agent-tools/
 components/
 dependencies.lock
+tests/test_btstack_backend

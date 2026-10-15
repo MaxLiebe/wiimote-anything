@@ -21,6 +21,8 @@ bool wiimote_connected_flag(void);
 uint8_t wiimote_current_battery(void);
 void wiimote_note_leds(uint8_t mask);
 void wiimote_note_rumble(bool on);
+/** Backend: the discoverable window is closed (timeout, stop, or connection). */
+void wiimote_note_sync_ended(void);
 
 #ifdef __cplusplus
 }

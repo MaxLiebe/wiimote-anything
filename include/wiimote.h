@@ -56,6 +56,14 @@ typedef void (*wiimote_motion_cb_t)(int16_t *accel_mg_x,
                                    int16_t *yaw_dps,
                                    void *user);
 
+/** How long wiimote_sync() keeps the ESP32 discoverable. */
+#define WIIMOTE_SYNC_WINDOW_MS 20000
+
+/**
+ * Callbacks. With the BTstack backend they all run on the BTstack thread, so
+ * they may call BTstack (and Bluepad32 "_unsafe") functions directly. They must
+ * not block.
+ */
 typedef struct {
     void (*connected)(void *user);
     void (*disconnected)(void *user);
@@ -66,6 +74,8 @@ typedef struct {
     void (*battery)(uint8_t *level, void *user);
     void (*extension_changed)(wiimote_extension_t extension, void *user);
     void *user;
+    /** The sync (discoverable) window opened (true) or closed (false). */
+    void (*sync_changed)(bool active, void *user);
 } wiimote_callbacks_t;
 
 typedef struct {
@@ -74,10 +84,12 @@ typedef struct {
     const wiimote_pins_t *pins;
     const wiimote_callbacks_t *callbacks;
     /**
-     * For BTstack / Bluepad32 integration:
-     * When true, Wiimote assumes BTstack is already initialized and managed externally
-     * (e.g. by Bluepad32 or custom app), so it attaches to the existing run loop without
-     * reinitializing the ESP32 controller. Default false.
+     * BTstack only. false: wiimote_init() calls btstack_init(), powers the
+     * controller on and runs the BTstack loop in its own task.
+     * true: the application owns BTstack (e.g. Bluepad32). Call wiimote_init()
+     * after btstack_init() and before the stack is powered on (before
+     * uni_init()). Calling it later also works, but then the host stack sees
+     * the console's connection request first. See wiimote_btstack.h.
      */
     bool external_stack;
 } wiimote_config_t;
@@ -87,18 +99,46 @@ void wiimote_pins_init(wiimote_pins_t *pins);
 
 esp_err_t wiimote_init(const wiimote_config_t *config);
 
-/**
- * Register Wiimote L2CAP services and SDP records into an active BTstack instance.
- * Useful when integrating into Bluepad32 or custom BTstack event loops.
- */
+/** Deprecated: wiimote_init() registers the services. Kept for compatibility. */
 esp_err_t wiimote_btstack_register_services(void);
 
 /**
- * For 20 seconds, be connectable and limited-discoverable so a Wii that
- * pressed its red SYNC button can inquire on LIAC and open the ACL.
- * Then stay connectable and non-discoverable.
+ * The red SYNC button on the back of a remote. For WIIMOTE_SYNC_WINDOW_MS, be
+ * connectable and limited-discoverable so a Wii whose own SYNC button was
+ * pressed can find us and pair. The console that pairs is remembered.
+ * Afterwards stay connectable and non-discoverable.
  */
 esp_err_t wiimote_sync(void);
+bool wiimote_is_syncing(void);
+
+/**
+ * What a bonded remote does when you press a button: page the console synced
+ * last and open the HID channels. Asynchronous; `connected` fires on success.
+ * ESP_ERR_NOT_FOUND when nothing was synced yet. BTstack backend only.
+ */
+esp_err_t wiimote_connect(void);
+/** Drop the console link (it can reconnect later). */
+esp_err_t wiimote_disconnect(void);
+/** A console has been synced and is remembered across reboots. */
+bool wiimote_has_paired_host(void);
+/** Forget the remembered console and its link key. */
+esp_err_t wiimote_forget_host(void);
+
+/**
+ * Send any changed input to the console now instead of on the next 5 ms tick
+ * (still at most one report per reporting period). Call after a batch of
+ * setters, e.g. once per gamepad report. Thread-safe.
+ */
+void wiimote_send_now(void);
+/** The ESP32 is master of the console link (BTstack; false when unknown). */
+bool wiimote_link_is_master(void);
+/**
+ * HCI reason of the last console disconnect: 0x08 link timeout,
+ * 0x13 console hung up, 0x15 console powered off, 0x16 we hung up.
+ */
+uint8_t wiimote_last_disconnect_reason(void);
+
+/** Disconnect, stop being discoverable, and (standalone) stop being connectable. */
 esp_err_t wiimote_stop(void);
 
 esp_err_t wiimote_set_extension(wiimote_extension_t extension);

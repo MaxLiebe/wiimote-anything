@@ -2,17 +2,30 @@
 /*
  * Bluetooth Classic HID peripheral built on BlueKitchen BTstack.
  *
- * Implements Nintendo RVL-CNT-01 (Wiimote) over BTstack L2CAP:
- *   - L2CAP PSM 0x0011 (HID Control)
- *   - L2CAP PSM 0x0013 (HID Interrupt)
- *   - Service Discovery Protocol (SDP) record with the real RVL-CNT-01 HID descriptor
- *   - Device ID (PnP) SDP record (Nintendo 0x057E / 0x0306)
- *   - Device Class: 0x002504 (Peripheral, Joystick, Limited Discoverable)
- *   - Device Name: "Nintendo RVL-CNT-01"
- *   - Legacy PIN pairing with console BD_ADDR reversed (6 bytes, SSP disabled)
- *   - 100 Hz periodic core reporting via BTstack run loop timer
+ * The ESP32 presents itself as a Nintendo RVL-CNT-01:
+ *   - local name "Nintendo RVL-CNT-01", class of device 0x002504
+ *   - HID SDP record with the real remote's descriptor, PnP record 057e:0306
+ *   - L2CAP PSM 0x11 (HID control) and 0x13 (HID interrupt)
+ *   - legacy PIN pairing, PIN = the console's BD_ADDR reversed
+ *   - reconnects to the last synced console by paging it, like a real remote
  *
- * Can run standalone on ESP32 or attach into an existing BTstack environment (e.g. Bluepad32).
+ * Sharing BTstack with an HID host (Bluepad32)
+ * --------------------------------------------
+ * A Wii (host -> us) and a gamepad that reconnects to us (device -> host) both
+ * open L2CAP channels on PSM 0x11 / 0x13. BTstack allows only one service per
+ * PSM, so this file owns both PSMs and hands everything that is not the Wii to
+ * the fallback handler set with wiimote_btstack_set_fallback_handler(). The
+ * Wii link is told apart by its class of device (a console is not a
+ * "peripheral") or by being the console we synced with before.
+ *
+ * Our HCI event handler sits at the head of BTstack's handler list. For the Wii
+ * link it consumes the connection request and the PIN request (by rewriting the
+ * event type to HCI_EVENT_NOP), so the host stack neither allocates a device
+ * slot for the console nor answers the PIN with the wrong code. Every other
+ * event passes through untouched.
+ *
+ * Nothing in here starts, stops, or otherwise manages scanning for gamepads.
+ * That belongs to the application.
  */
 #include "wiimote_bt.h"
 
@@ -28,27 +41,36 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs_flash.h"
 
 #include "btstack.h"
+#include "btstack_tlv.h"
+#include "classic/device_id_server.h"
 #include "classic/sdp_server.h"
 #include "classic/sdp_util.h"
-#include "classic/core.h"
-#include "classic/device_id_server.h"
 
 #if __has_include("btstack_port_esp32.h")
 #include "btstack_port_esp32.h"
+#define WIIMOTE_HAVE_ESP32_PORT 1
 #endif
 
-#if __has_include("esp_bt.h")
-#include "esp_bt.h"
-#endif
+#include "../include/wiimote_btstack.h"
 
-static const char *TAG = "wiimote_btstack";
+static const char *TAG = "wiimote_bt";
 
-/* Dolphin hcidump of a real RVL-CNT-01 HID descriptor list (attr 0x0206).
- * Output items are 0x91 0x00 and input items are 0x81 0x00. */
-static const uint8_t s_rvl_hid_report[] = {
+#define WM_PSM_CONTROL 0x0011
+#define WM_PSM_INTERRUPT 0x0013
+#define WM_L2CAP_MTU 672
+#define WM_REPORT_TICK_MS 5
+#define WM_TLV_TAG_HOST 0x57694948u /* 'WiIH' */
+
+#define WM_COD 0x002504u
+#define WM_COD_MAJOR_MASK 0x001f00u
+#define WM_COD_MAJOR_PERIPHERAL 0x000500u
+
+static const char k_local_name[] = "Nintendo RVL-CNT-01";
+
+/* Real RVL-CNT-01 HID report descriptor (Dolphin / hcidump of attribute 0x0206). */
+static const uint8_t k_rvl_hid_descriptor[] = {
     0x05, 0x01, 0x09, 0x05, 0xa1, 0x01,
     0x85, 0x10, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x01, 0x06, 0x00, 0xff, 0x09, 0x01, 0x91, 0x00,
     0x85, 0x11, 0x95, 0x01, 0x09, 0x01, 0x91, 0x00,
@@ -78,295 +100,542 @@ static const uint8_t s_rvl_hid_report[] = {
     0xc0,
 };
 
-static uint8_t s_hid_sdp_record[512];
-static uint32_t s_hid_handle = 0;
-static uint8_t s_device_id_sdp_record[128];
-static uint32_t s_device_id_handle = 0;
+/* ---------------------------------------------------------------- state -- */
 
-static uint16_t s_cid_control = 0;
-static uint16_t s_cid_interrupt = 0;
-static uint16_t s_con_handle = HCI_CON_HANDLE_INVALID;
-static bd_addr_t s_bda;
-static bool s_have_host_bda = false;
-static bool s_sync_window = false;
-static bool s_hid_ready = false;
-static bool s_btstack_started = false;
+static bool s_external_stack;
+static bool s_setup_done;
+static bool s_sdp_registered;
+static btstack_packet_handler_t s_fallback;
 
-static bool s_gamepad_connecting = false;
-static bool s_gamepad_connected = false;
-static bd_addr_t s_gamepad_addr;
-static uint16_t s_gamepad_handle = HCI_CON_HANDLE_INVALID;
-static int64_t s_outbound_busy_until_us = 0;
-static bool s_name_req_pending = false;
-static int64_t s_name_req_cancel_at_us = 0;
+/* ~370 bytes with BTstack's 3-byte sequence headers; the test checks the fit. */
+static uint8_t s_hid_record[600];
+static uint8_t s_pnp_record[128];
+static uint32_t s_hid_record_handle;
+static uint32_t s_pnp_record_handle;
 
-/* Optional Bluepad32 hooks when sharing BTstack with Bluepad32 */
-extern void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
-    __attribute__((weak));
-extern void uni_bt_stop_scanning_unsafe(void) __attribute__((weak));
-extern void uni_bt_start_scanning_and_autoconnect_unsafe(void) __attribute__((weak));
-
-static void pause_gamepad_scanning(void)
-{
-    if (uni_bt_stop_scanning_unsafe != NULL) {
-        uni_bt_stop_scanning_unsafe();
-    }
-    gap_inquiry_stop();
-    gap_stop_scan();
-}
-
-static void resume_gamepad_scanning(void)
-{
-    if (!s_sync_window && !s_gamepad_connected && uni_bt_start_scanning_and_autoconnect_unsafe != NULL) {
-        uni_bt_start_scanning_and_autoconnect_unsafe();
-    }
-}
-
-static bool is_wii_host_addr(const bd_addr_t addr)
-{
-    if (uni_bt_packet_handler == NULL) {
-        return true;
-    }
-    return s_have_host_bda && (bd_addr_cmp(addr, s_bda) == 0);
-}
-
-static btstack_packet_callback_registration_t s_hci_event_callback_registration;
+static btstack_packet_callback_registration_t s_hci_registration;
 static btstack_timer_source_t s_report_timer;
-static btstack_context_callback_registration_t s_init_registration;
-static btstack_context_callback_registration_t s_sync_registration;
-static btstack_context_callback_registration_t s_listen_registration;
-static btstack_context_callback_registration_t s_stop_registration;
+static bool s_report_timer_active;
 
-static uint8_t s_last_leds = 0;
-static bool s_have_leds = false;
-static uint8_t s_last_rumble = 0;
-static bool s_have_rumble = false;
+/* The console we synced with last (persisted in TLV). */
+static bd_addr_t s_host_addr;
+static volatile bool s_have_host;
 
+/* The console link that is up or being set up. */
+static bool s_link_claimed;
+static bd_addr_t s_link_addr;
+static hci_con_handle_t s_link_handle = HCI_CON_HANDLE_INVALID;
+static bool s_link_outgoing;
+static uint16_t s_cid_control;
+static uint16_t s_cid_interrupt;
+static bool s_control_open;
+static bool s_interrupt_open;
+static bool s_link_up;
+static bool s_link_master; /* our role on the console link, from ROLE_CHANGE */
+static btstack_timer_source_t s_connect_watchdog;
+#define WM_CONNECT_TIMEOUT_MS 15000
+
+/* Role chosen by connection_filter() for the most recent incoming ACL. */
+static bool s_filter_chose_slave;
+static bd_addr_t s_filter_addr;
+/* A gamepad accepted as slave because it had no link key yet. */
+static bool s_role_fix_pending;
+static bd_addr_t s_role_fix_addr;
+
+static bool s_sync_active;
+
+/* HID handshake owed on the control channel (0xff = none). */
+static uint8_t s_pending_handshake = 0xff;
+
+static uint8_t s_last_leds;
+static bool s_have_leds;
+static bool s_last_rumble;
+static bool s_have_rumble;
+
+/* Raw HCI commands that BTstack has no GAP setter for. */
+#define WM_CMD_INQUIRY_SCAN_INTERLACED (1u << 0)
+#define WM_CMD_WRITE_IAC_LIAC_GIAC (1u << 1)
+#define WM_CMD_CANCEL_PAGE (1u << 2)
+#define WM_CMD_POWER_OFF_DISCONNECT (1u << 3)
+static uint32_t s_pending_cmds;
+static bd_addr_t s_cancel_addr;
+static hci_con_handle_t s_poweroff_handle;
+/* Per-link policy writes (no sniff: sniff adds up to one sniff interval of
+ * input latency on every report). */
+static struct {
+    hci_con_handle_t handle;
+    uint16_t policy;
+} s_policy_q[4];
+static int s_policy_count;
+/* Per-link QoS requests. As master, the controller decides how often it
+ * polls each slave; a slave (the gamepad) can only send when polled, so a
+ * long poll interval is pure input latency. QoS Setup asks for a short one. */
+#ifndef WIIMOTE_QOS_LATENCY_US
+#define WIIMOTE_QOS_LATENCY_US 1250 /* 2 slots */
+#endif
+#define WM_QOS_BEST_EFFORT 0x01
+#define WM_QOS_GUARANTEED 0x02
+static struct {
+    hci_con_handle_t handle;
+    uint8_t service_type;
+} s_qos_q[4];
+static int s_qos_count;
+static hci_con_handle_t s_qos_inflight_handle = HCI_CON_HANDLE_INVALID;
+static uint8_t s_qos_inflight_type;
+static uint8_t s_last_disconnect_reason;
+/* Role switch was turned off for our page to the console; turn it back on. */
+static bool s_restore_role_switch;
+
+/* Requests posted from other tasks; executed on the BTstack thread. */
+#define WM_REQ_SYNC (1u << 0)
+#define WM_REQ_LISTEN (1u << 1)
+#define WM_REQ_STOP (1u << 2)
+#define WM_REQ_CONNECT (1u << 3)
+#define WM_REQ_DISCONNECT (1u << 4)
+#define WM_REQ_FORGET (1u << 5)
+#define WM_REQ_SETUP (1u << 6)
+#define WM_REQ_FLUSH (1u << 7)
+static portMUX_TYPE s_req_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_requests;
+static btstack_context_callback_registration_t s_req_registration;
+
+static void wm_l2cap_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+static void wm_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
 static void flush_reports(void);
 
-typedef struct {
-    uint8_t *p;
-    uint8_t *end;
-} wm_w;
+/* -------------------------------------------------------------- helpers -- */
 
-static void ww_u8(wm_w *w, uint8_t v)
+static bool addr_eq(const bd_addr_t a, const bd_addr_t b)
 {
-    if (w->p < w->end) {
-        *w->p++ = v;
+    return memcmp(a, b, BD_ADDR_LEN) == 0;
+}
+
+static bool on_btstack_thread_or_not_running(void)
+{
+    /* Before the run loop starts (HCI off), app_main may call BTstack directly. */
+    return hci_get_state() == HCI_STATE_OFF;
+}
+
+static void load_host(void)
+{
+    const btstack_tlv_t *tlv = NULL;
+    void *ctx = NULL;
+    uint8_t buf[BD_ADDR_LEN];
+    btstack_tlv_get_instance(&tlv, &ctx);
+    if (tlv == NULL) {
+        return;
+    }
+    if (tlv->get_tag(ctx, WM_TLV_TAG_HOST, buf, sizeof(buf)) == (int)sizeof(buf)) {
+        memcpy(s_host_addr, buf, BD_ADDR_LEN);
+        s_have_host = true;
+        ESP_LOGI(TAG, "Paired console: %s", bd_addr_to_str(s_host_addr));
     }
 }
 
-static void ww_u16(wm_w *w, uint16_t v)
+static void store_host(const bd_addr_t addr)
 {
-    ww_u8(w, (uint8_t)(v >> 8));
-    ww_u8(w, (uint8_t)v);
+    const btstack_tlv_t *tlv = NULL;
+    void *ctx = NULL;
+    if (s_have_host && addr_eq(addr, s_host_addr)) {
+        return;
+    }
+    memcpy(s_host_addr, addr, BD_ADDR_LEN);
+    s_have_host = true;
+    btstack_tlv_get_instance(&tlv, &ctx);
+    if (tlv != NULL) {
+        tlv->store_tag(ctx, WM_TLV_TAG_HOST, (const uint8_t *)s_host_addr, BD_ADDR_LEN);
+    }
+    ESP_LOGI(TAG, "Remembering console %s", bd_addr_to_str(s_host_addr));
 }
 
-static void ww_bytes(wm_w *w, const uint8_t *b, int n)
+static void forget_host(void)
 {
-    for (int i = 0; i < n; i++) {
-        ww_u8(w, b[i]);
+    const btstack_tlv_t *tlv = NULL;
+    void *ctx = NULL;
+    if (s_have_host) {
+        gap_drop_link_key_for_bd_addr(s_host_addr);
+    }
+    s_have_host = false;
+    memset(s_host_addr, 0, sizeof(s_host_addr));
+    btstack_tlv_get_instance(&tlv, &ctx);
+    if (tlv != NULL) {
+        tlv->delete_tag(ctx, WM_TLV_TAG_HOST);
+    }
+    ESP_LOGI(TAG, "Forgot paired console");
+}
+
+/* Is this remote (address + class of device) the console rather than a gamepad? */
+static bool is_console(const bd_addr_t addr, uint32_t cod, bool cod_known)
+{
+    if (s_fallback == NULL) {
+        return true; /* Standalone: every host that connects is a console. */
+    }
+    if (s_link_claimed && addr_eq(addr, s_link_addr)) {
+        return true;
+    }
+    if (s_have_host && addr_eq(addr, s_host_addr)) {
+        return true;
+    }
+    if (!cod_known) {
+        return false;
+    }
+    /* Gamepads, keyboards, Wii remotes: major class "peripheral". The Wii is
+     * Audio/Video "gaming/toy" (0x000448); Dolphin hosts are computers. */
+    return (cod & WM_COD_MAJOR_MASK) != WM_COD_MAJOR_PERIPHERAL;
+}
+
+static bool is_console_link_addr(const bd_addr_t addr)
+{
+    return s_link_claimed && addr_eq(addr, s_link_addr);
+}
+
+static void claim_link(const bd_addr_t addr, bool outgoing)
+{
+    s_link_claimed = true;
+    memcpy(s_link_addr, addr, BD_ADDR_LEN);
+    s_link_outgoing = outgoing;
+    s_link_master = outgoing; /* the pager starts as master */
+    s_link_handle = HCI_CON_HANDLE_INVALID;
+    s_last_disconnect_reason = 0; /* 0 = closed without an HCI reason */
+}
+
+static void report_timer_cb(btstack_timer_source_t *ts)
+{
+    flush_reports();
+    btstack_run_loop_set_timer(ts, WM_REPORT_TICK_MS);
+    btstack_run_loop_add_timer(ts);
+}
+
+static void report_timer_start(void)
+{
+    if (s_report_timer_active) {
+        return;
+    }
+    s_report_timer_active = true;
+    btstack_run_loop_set_timer_handler(&s_report_timer, report_timer_cb);
+    btstack_run_loop_set_timer(&s_report_timer, WM_REPORT_TICK_MS);
+    btstack_run_loop_add_timer(&s_report_timer);
+}
+
+static void report_timer_stop(void)
+{
+    if (!s_report_timer_active) {
+        return;
+    }
+    s_report_timer_active = false;
+    btstack_run_loop_remove_timer(&s_report_timer);
+}
+
+static void release_link(void)
+{
+    bool was_up = s_link_up;
+    s_link_claimed = false;
+    s_link_outgoing = false;
+    s_link_up = false;
+    s_link_handle = HCI_CON_HANDLE_INVALID;
+    s_cid_control = 0;
+    s_cid_interrupt = 0;
+    s_control_open = false;
+    s_interrupt_open = false;
+    s_pending_handshake = 0xff;
+    s_have_leds = false;
+    s_have_rumble = false;
+    report_timer_stop();
+    btstack_run_loop_remove_timer(&s_connect_watchdog);
+    if (s_restore_role_switch) {
+        s_restore_role_switch = false;
+        gap_set_allow_role_switch(true);
+    }
+    if (was_up) {
+        ESP_LOGI(TAG, "Console link down");
+    }
+    wiimote_set_connected(false);
+}
+
+/* --------------------------------------------------------- HCI commands -- */
+
+static void pump_pending_cmds(void)
+{
+    if ((s_pending_cmds == 0 && s_policy_count == 0 && s_qos_count == 0) || hci_get_state() != HCI_STATE_WORKING ||
+        !hci_can_send_command_packet_now()) {
+        return;
+    }
+    if (s_pending_cmds & WM_CMD_POWER_OFF_DISCONNECT) {
+        s_pending_cmds &= ~WM_CMD_POWER_OFF_DISCONNECT;
+        /* 0x15: "remote device terminated connection due to power off", what
+         * a remote that is switched off sends. */
+        hci_send_cmd(&hci_disconnect, s_poweroff_handle, ERROR_CODE_REMOTE_DEVICE_TERMINATED_CONNECTION_DUE_TO_POWER_OFF);
+        return;
+    }
+    if (s_policy_count > 0) {
+        s_policy_count--;
+        hci_send_cmd(&hci_write_link_policy_settings, s_policy_q[s_policy_count].handle,
+                     s_policy_q[s_policy_count].policy);
+        return;
+    }
+    if (s_qos_count > 0) {
+        s_qos_count--;
+        s_qos_inflight_handle = s_qos_q[s_qos_count].handle;
+        s_qos_inflight_type = s_qos_q[s_qos_count].service_type;
+        /* flags, service type, token rate (B/s), peak bandwidth (0 = not
+         * specified), latency (us), delay variation (don't care). */
+        hci_send_cmd(&hci_qos_setup, s_qos_inflight_handle, 0, s_qos_inflight_type, 20000, 0,
+                     (uint32_t)WIIMOTE_QOS_LATENCY_US, 0xffffffffu);
+        return;
+    }
+    if (s_pending_cmds & WM_CMD_CANCEL_PAGE) {
+        s_pending_cmds &= ~WM_CMD_CANCEL_PAGE;
+        hci_send_cmd(&hci_create_connection_cancel, s_cancel_addr);
+        return;
+    }
+    if (s_pending_cmds & WM_CMD_INQUIRY_SCAN_INTERLACED) {
+        s_pending_cmds &= ~WM_CMD_INQUIRY_SCAN_INTERLACED;
+        hci_send_cmd(&hci_write_inquiry_scan_type, 1);
+        return;
+    }
+    if (s_pending_cmds & WM_CMD_WRITE_IAC_LIAC_GIAC) {
+        s_pending_cmds &= ~WM_CMD_WRITE_IAC_LIAC_GIAC;
+        hci_send_cmd(&hci_write_current_iac_lap_two_iacs, 2, GAP_IAC_LIMITED_INQUIRY, GAP_IAC_GENERAL_INQUIRY);
+        return;
     }
 }
 
-static uint8_t *ww_seq_open(wm_w *w, int wide)
+static void queue_link_policy(hci_con_handle_t handle, uint16_t policy)
 {
-    uint8_t *lenp;
-    ww_u8(w, (uint8_t)(wide ? 0x36 : 0x35));
-    lenp = w->p;
-    ww_u8(w, 0);
-    if (wide) {
-        ww_u8(w, 0);
+    if (s_policy_count < (int)(sizeof(s_policy_q) / sizeof(s_policy_q[0]))) {
+        s_policy_q[s_policy_count].handle = handle;
+        s_policy_q[s_policy_count].policy = policy;
+        s_policy_count++;
     }
-    return lenp;
+    pump_pending_cmds();
 }
 
-static void ww_seq_close(uint8_t *lenp, uint8_t *end, int wide)
+static void queue_qos(hci_con_handle_t handle, uint8_t service_type)
 {
-    int n = (int)(end - (lenp + (wide ? 2 : 1)));
-    if (n < 0) {
-        n = 0;
+    if (s_qos_count < (int)(sizeof(s_qos_q) / sizeof(s_qos_q[0]))) {
+        s_qos_q[s_qos_count].handle = handle;
+        s_qos_q[s_qos_count].service_type = service_type;
+        s_qos_count++;
     }
-    if (wide) {
-        lenp[0] = (uint8_t)(n >> 8);
-        lenp[1] = (uint8_t)n;
-    } else if (lenp < end) {
-        lenp[0] = (uint8_t)n;
+    pump_pending_cmds();
+}
+
+/* The controller refused the request: retry once as best effort, which
+ * controllers that cannot guarantee anything usually still accept. */
+static void qos_failed(hci_con_handle_t handle, uint8_t status)
+{
+    if (s_qos_inflight_type == WM_QOS_GUARANTEED) {
+        ESP_LOGI(TAG, "QoS (guaranteed) refused on 0x%04x (status 0x%02x), trying best effort", handle, status);
+        queue_qos(handle, WM_QOS_BEST_EFFORT);
+    } else {
+        ESP_LOGW(TAG, "QoS refused on 0x%04x (status 0x%02x); the controller keeps its poll interval", handle,
+                 status);
     }
 }
 
-static void emit_id(wm_w *w, uint16_t id)
-{
-    ww_u8(w, 0x09);
-    ww_u16(w, id);
-}
+/* ------------------------------------------------------------------ SDP -- */
 
-static void emit_u8_attr(wm_w *w, uint16_t id, uint8_t v)
+static void build_hid_record(uint8_t *service, uint32_t handle)
 {
-    emit_id(w, id);
-    ww_u8(w, 0x08);
-    ww_u8(w, v);
-}
-
-static void emit_u16_attr(wm_w *w, uint16_t id, uint16_t v)
-{
-    emit_id(w, id);
-    ww_u8(w, 0x09);
-    ww_u16(w, v);
-}
-
-static void emit_bool_attr(wm_w *w, uint16_t id, uint8_t v)
-{
-    emit_id(w, id);
-    ww_u8(w, 0x28);
-    ww_u8(w, v);
-}
-
-static void emit_text_attr(wm_w *w, uint16_t id, const char *s)
-{
-    int n = (int)strlen(s);
-    emit_id(w, id);
-    ww_u8(w, 0x25);
-    ww_u8(w, (uint8_t)n);
-    ww_bytes(w, (const uint8_t *)s, n);
-}
-
-static void emit_proto_pair(wm_w *w, uint16_t psm)
-{
-    ww_u8(w, 0x35);
-    ww_u8(w, 0x06);
-    ww_u8(w, 0x19);
-    ww_u16(w, 0x0100);
-    ww_u8(w, 0x09);
-    ww_u16(w, psm);
-    ww_u8(w, 0x35);
-    ww_u8(w, 0x03);
-    ww_u8(w, 0x19);
-    ww_u16(w, 0x0011);
-}
-
-static int build_hid_sdp_record(uint8_t *dst, int cap, uint32_t handle)
-{
-    wm_w w;
-    uint8_t *record_seq;
+    uint8_t *attr;
     uint8_t *seq;
-    uint8_t *outer;
     uint8_t *inner;
 
-    w.p = dst;
-    w.end = dst + cap;
+    de_create_sequence(service);
 
-    record_seq = ww_seq_open(&w, 1);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_SERVICE_RECORD_HANDLE);
+    de_add_number(service, DE_UINT, DE_SIZE_32, handle);
 
-    /* 0x0000: ServiceRecordHandle */
-    emit_id(&w, 0x0000);
-    ww_u8(&w, 0x0a);
-    ww_u8(&w, (uint8_t)(handle >> 24));
-    ww_u8(&w, (uint8_t)(handle >> 16));
-    ww_u8(&w, (uint8_t)(handle >> 8));
-    ww_u8(&w, (uint8_t)handle);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_SERVICE_CLASS_ID_LIST);
+    attr = de_push_sequence(service);
+    de_add_number(attr, DE_UUID, DE_SIZE_16, BLUETOOTH_SERVICE_CLASS_HUMAN_INTERFACE_DEVICE_SERVICE);
+    de_pop_sequence(service, attr);
 
-    /* 0x0001: ServiceClassIDList (UUID 0x1124 - HID) */
-    emit_id(&w, 0x0001);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x03);
-    ww_u8(&w, 0x19);
-    ww_u16(&w, 0x1124);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_PROTOCOL_DESCRIPTOR_LIST);
+    attr = de_push_sequence(service);
+    seq = de_push_sequence(attr);
+    de_add_number(seq, DE_UUID, DE_SIZE_16, BLUETOOTH_PROTOCOL_L2CAP);
+    de_add_number(seq, DE_UINT, DE_SIZE_16, WM_PSM_CONTROL);
+    de_pop_sequence(attr, seq);
+    seq = de_push_sequence(attr);
+    de_add_number(seq, DE_UUID, DE_SIZE_16, BLUETOOTH_PROTOCOL_HIDP);
+    de_pop_sequence(attr, seq);
+    de_pop_sequence(service, attr);
 
-    /* 0x0004: ProtocolDescriptorList (L2CAP PSM 0x0011, HIDP 0x0011) */
-    emit_id(&w, 0x0004);
-    seq = ww_seq_open(&w, 0);
-    emit_proto_pair(&w, 0x0011);
-    ww_seq_close(seq, w.p, 0);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_BROWSE_GROUP_LIST);
+    attr = de_push_sequence(service);
+    de_add_number(attr, DE_UUID, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_PUBLIC_BROWSE_ROOT);
+    de_pop_sequence(service, attr);
 
-    /* 0x0005: BrowseGroupList (PublicBrowseGroup 0x1002) */
-    emit_id(&w, 0x0005);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x03);
-    ww_u8(&w, 0x19);
-    ww_u16(&w, 0x1002);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_LANGUAGE_BASE_ATTRIBUTE_ID_LIST);
+    attr = de_push_sequence(service);
+    de_add_number(attr, DE_UINT, DE_SIZE_16, 0x656e); /* "en" */
+    de_add_number(attr, DE_UINT, DE_SIZE_16, 0x006a); /* UTF-8 */
+    de_add_number(attr, DE_UINT, DE_SIZE_16, 0x0100); /* base */
+    de_pop_sequence(service, attr);
 
-    /* 0x0006: LanguageBaseAttributeIDList ("en", UTF-8 0x006a, base 0x0100) */
-    emit_id(&w, 0x0006);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x09);
-    ww_u8(&w, 0x09);
-    ww_u16(&w, 0x656e);
-    ww_u8(&w, 0x09);
-    ww_u16(&w, 0x006a);
-    ww_u8(&w, 0x09);
-    ww_u16(&w, 0x0100);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_BLUETOOTH_PROFILE_DESCRIPTOR_LIST);
+    attr = de_push_sequence(service);
+    seq = de_push_sequence(attr);
+    de_add_number(seq, DE_UUID, DE_SIZE_16, BLUETOOTH_SERVICE_CLASS_HUMAN_INTERFACE_DEVICE_SERVICE);
+    de_add_number(seq, DE_UINT, DE_SIZE_16, 0x0100);
+    de_pop_sequence(attr, seq);
+    de_pop_sequence(service, attr);
 
-    /* 0x0009: BluetoothProfileDescriptorList (HID 1.0) */
-    emit_id(&w, 0x0009);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x08);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x06);
-    ww_u8(&w, 0x19);
-    ww_u16(&w, 0x1124);
-    ww_u8(&w, 0x09);
-    ww_u16(&w, 0x0100);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_ADDITIONAL_PROTOCOL_DESCRIPTOR_LISTS);
+    attr = de_push_sequence(service);
+    seq = de_push_sequence(attr);
+    inner = de_push_sequence(seq);
+    de_add_number(inner, DE_UUID, DE_SIZE_16, BLUETOOTH_PROTOCOL_L2CAP);
+    de_add_number(inner, DE_UINT, DE_SIZE_16, WM_PSM_INTERRUPT);
+    de_pop_sequence(seq, inner);
+    inner = de_push_sequence(seq);
+    de_add_number(inner, DE_UUID, DE_SIZE_16, BLUETOOTH_PROTOCOL_HIDP);
+    de_pop_sequence(seq, inner);
+    de_pop_sequence(attr, seq);
+    de_pop_sequence(service, attr);
 
-    /* 0x000d: AdditionalProtocolDescriptorList (L2CAP PSM 0x0013, HIDP 0x0011) */
-    emit_id(&w, 0x000d);
-    seq = ww_seq_open(&w, 0);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x0d);
-    emit_proto_pair(&w, 0x0013);
-    ww_seq_close(seq, w.p, 0);
+    de_add_number(service, DE_UINT, DE_SIZE_16, 0x0100); /* ServiceName */
+    de_add_data(service, DE_STRING, (uint16_t)strlen(k_local_name), (uint8_t *)k_local_name);
+    de_add_number(service, DE_UINT, DE_SIZE_16, 0x0101); /* ServiceDescription */
+    de_add_data(service, DE_STRING, (uint16_t)strlen(k_local_name), (uint8_t *)k_local_name);
+    de_add_number(service, DE_UINT, DE_SIZE_16, 0x0102); /* ProviderName */
+    de_add_data(service, DE_STRING, 8, (uint8_t *)"Nintendo");
 
-    /* String attributes */
-    emit_text_attr(&w, 0x0100, "Nintendo RVL-CNT-01");
-    emit_text_attr(&w, 0x0101, "Nintendo RVL-CNT-01");
-    emit_text_attr(&w, 0x0102, "Nintendo");
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_DEVICE_RELEASE_NUMBER);
+    de_add_number(service, DE_UINT, DE_SIZE_16, 0x0100);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_PARSER_VERSION);
+    de_add_number(service, DE_UINT, DE_SIZE_16, 0x0111);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_DEVICE_SUBCLASS);
+    de_add_number(service, DE_UINT, DE_SIZE_8, 0x04);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_COUNTRY_CODE);
+    de_add_number(service, DE_UINT, DE_SIZE_8, 0x33);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_VIRTUAL_CABLE);
+    de_add_number(service, DE_BOOL, DE_SIZE_8, 0);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_RECONNECT_INITIATE);
+    de_add_number(service, DE_BOOL, DE_SIZE_8, 1);
 
-    /* HID attributes */
-    emit_u16_attr(&w, 0x0200, 0x0100); /* Release number */
-    emit_u16_attr(&w, 0x0201, 0x0111); /* Parser version */
-    emit_u8_attr(&w, 0x0202, 0x04);    /* Subclass: Joystick */
-    emit_u8_attr(&w, 0x0203, 0x33);    /* Country code */
-    emit_bool_attr(&w, 0x0204, 0);     /* Virtual cable */
-    emit_bool_attr(&w, 0x0205, 1);     /* Reconnect initiate */
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_DESCRIPTOR_LIST);
+    attr = de_push_sequence(service);
+    seq = de_push_sequence(attr);
+    de_add_number(seq, DE_UINT, DE_SIZE_8, 0x22); /* Report descriptor */
+    de_add_data(seq, DE_STRING, (uint16_t)sizeof(k_rvl_hid_descriptor), (uint8_t *)k_rvl_hid_descriptor);
+    de_pop_sequence(attr, seq);
+    de_pop_sequence(service, attr);
 
-    /* 0x0206: HIDDescriptorList */
-    emit_id(&w, 0x0206);
-    outer = ww_seq_open(&w, 0);
-    inner = ww_seq_open(&w, 0);
-    ww_u8(&w, 0x08);
-    ww_u8(&w, 0x22); /* Report descriptor tag */
-    ww_u8(&w, 0x25); /* Text/byte string tag */
-    ww_u8(&w, (uint8_t)sizeof(s_rvl_hid_report));
-    ww_bytes(&w, s_rvl_hid_report, (int)sizeof(s_rvl_hid_report));
-    ww_seq_close(inner, w.p, 0);
-    ww_seq_close(outer, w.p, 0);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HIDLANGID_BASE_LIST);
+    attr = de_push_sequence(service);
+    seq = de_push_sequence(attr);
+    de_add_number(seq, DE_UINT, DE_SIZE_16, 0x0409);
+    de_add_number(seq, DE_UINT, DE_SIZE_16, 0x0100);
+    de_pop_sequence(attr, seq);
+    de_pop_sequence(service, attr);
 
-    /* 0x0207: HIDLANGIDBaseList */
-    emit_id(&w, 0x0207);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x08);
-    ww_u8(&w, 0x35);
-    ww_u8(&w, 0x06);
-    ww_u8(&w, 0x09);
-    ww_u16(&w, 0x0409);
-    ww_u8(&w, 0x09);
-    ww_u16(&w, 0x0100);
-
-    emit_bool_attr(&w, 0x0208, 0);     /* SDP disable */
-    emit_bool_attr(&w, 0x0209, 1);     /* Battery power */
-    emit_bool_attr(&w, 0x020a, 1);     /* Remote wake */
-    emit_u16_attr(&w, 0x020b, 0x0100); /* Profile version */
-    emit_u16_attr(&w, 0x020c, 0x0c80); /* Supervision timeout */
-    emit_bool_attr(&w, 0x020d, 0);     /* Normally connectable */
-    emit_bool_attr(&w, 0x020e, 0);     /* Boot device */
-
-    ww_seq_close(record_seq, w.p, 1);
-
-    if (w.p >= w.end) {
-        return -1;
-    }
-    return (int)(w.p - dst);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HIDSDP_DISABLE);
+    de_add_number(service, DE_BOOL, DE_SIZE_8, 0);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_BATTERY_POWER);
+    de_add_number(service, DE_BOOL, DE_SIZE_8, 1);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_REMOTE_WAKE);
+    de_add_number(service, DE_BOOL, DE_SIZE_8, 1);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_PROFILE_VERSION);
+    de_add_number(service, DE_UINT, DE_SIZE_16, 0x0100);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_SUPERVISION_TIMEOUT);
+    de_add_number(service, DE_UINT, DE_SIZE_16, 0x0c80);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_NORMALLY_CONNECTABLE);
+    de_add_number(service, DE_BOOL, DE_SIZE_8, 0);
+    de_add_number(service, DE_UINT, DE_SIZE_16, BLUETOOTH_ATTRIBUTE_HID_BOOT_DEVICE);
+    de_add_number(service, DE_BOOL, DE_SIZE_8, 0);
 }
+
+static void register_sdp_records(void)
+{
+    if (s_sdp_registered) {
+        return;
+    }
+    /* Bluepad32 registers its own Device ID record at 0x10003. A remote has
+     * exactly one PnP record, Nintendo's, so drop the host's. */
+    if (sdp_get_record_for_handle(0x10003) != NULL) {
+        sdp_unregister_service(0x10003);
+    }
+
+    s_hid_record_handle = sdp_create_service_record_handle();
+    memset(s_hid_record, 0, sizeof(s_hid_record));
+    build_hid_record(s_hid_record, s_hid_record_handle);
+    if (de_get_len(s_hid_record) > sizeof(s_hid_record)) {
+        ESP_LOGE(TAG, "HID SDP record overflow (%u bytes)", (unsigned)de_get_len(s_hid_record));
+        return;
+    }
+    sdp_register_service(s_hid_record);
+
+    s_pnp_record_handle = sdp_create_service_record_handle();
+    memset(s_pnp_record, 0, sizeof(s_pnp_record));
+    device_id_create_sdp_record(s_pnp_record, s_pnp_record_handle, DEVICE_ID_VENDOR_ID_SOURCE_USB, 0x057e, 0x0306,
+                                0x0600);
+    sdp_register_service(s_pnp_record);
+
+    s_sdp_registered = true;
+    ESP_LOGI(TAG, "SDP: HID record 0x%08lx (%u bytes), PnP record 0x%08lx", (unsigned long)s_hid_record_handle,
+             (unsigned)de_get_len(s_hid_record), (unsigned long)s_pnp_record_handle);
+}
+
+/* ------------------------------------------------------- GAP / identity -- */
+
+static void apply_identity(void)
+{
+    gap_set_local_name(k_local_name);
+    gap_set_class_of_device(WM_COD);
+    gap_set_allow_role_switch(true);
+    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
+    /* 5.12 s instead of 15.36 s: a page to a console that is still booting a
+     * game fails quickly and can be retried. */
+    gap_set_page_timeout(0x2000);
+    gap_connectable_control(1);
+}
+
+static void scan_activity_normal(void)
+{
+    gap_set_page_scan_activity(0x0800, 0x0012);
+    gap_inquiry_set_scan_activity(0x0800, 0x0012);
+}
+
+static void scan_activity_fast(void)
+{
+    /* About 11% duty while syncing, so the Wii's inquiry and page land fast. */
+    gap_set_page_scan_activity(0x0200, 0x0024);
+    gap_inquiry_set_scan_activity(0x0200, 0x0024);
+}
+
+static void on_hci_working(void)
+{
+    apply_identity();
+    register_sdp_records();
+    s_pending_cmds |= WM_CMD_INQUIRY_SCAN_INTERLACED | WM_CMD_WRITE_IAC_LIAC_GIAC;
+    pump_pending_cmds();
+    ESP_LOGI(TAG, "Wiimote BTstack services up (%s)", s_fallback ? "shared with host stack" : "standalone");
+}
+
+/* Called before BTstack accepts an incoming ACL: choose the role we ask for. */
+static int connection_filter(bd_addr_t addr, hci_link_type_t link_type)
+{
+    if (link_type == HCI_LINK_TYPE_ACL) {
+        link_key_t key;
+        link_key_type_t type;
+        bool known_console = s_have_host && addr_eq(addr, s_host_addr);
+        bool has_key = gap_get_link_key_for_bd_addr(addr, key, &type);
+        /* A console pages a remote and stays master, exactly like with a real
+         * Wiimote. Bonded gamepads that reconnect get "become master" so the
+         * ESP32 is master of its own piconet. Unknown devices are accepted
+         * without a role switch; if they turn out to be a gamepad, a switch
+         * is requested once the link is up. */
+        bool slave = (s_fallback == NULL) || known_console || !has_key;
+        hci_set_master_slave_policy(slave ? HCI_ROLE_SLAVE : HCI_ROLE_MASTER);
+        s_filter_chose_slave = slave;
+        memcpy(s_filter_addr, addr, BD_ADDR_LEN);
+    }
+    return 1;
+}
+
+/* ---------------------------------------------------- report transport -- */
 
 static void note_outputs(uint8_t leds, bool rumble)
 {
@@ -375,674 +644,867 @@ static void note_outputs(uint8_t leds, bool rumble)
         s_have_leds = true;
         wiimote_note_leds(leds);
     }
-    if (!s_have_rumble || (rumble ? 1 : 0) != s_last_rumble) {
-        s_last_rumble = rumble ? 1 : 0;
+    if (!s_have_rumble || rumble != s_last_rumble) {
+        s_last_rumble = rumble;
         s_have_rumble = true;
         wiimote_note_rumble(rumble);
     }
 }
 
-static uint32_t s_last_input_tx_ms = 0;
-
 static void flush_reports(void)
 {
     uint8_t pkt[32];
-    int n;
-    uint8_t leds;
-    bool rumble;
+    uint8_t leds = 0;
+    bool rumble = false;
+    bool have_outputs = false;
     uint32_t now;
-    wiimote_proto_t *proto;
+    int budget = 6;
 
-    if (!wiimote_ready() || s_cid_interrupt == 0) {
+    if (!wiimote_ready()) {
+        return;
+    }
+
+    if (s_pending_handshake != 0xff && s_cid_control != 0) {
+        if (l2cap_can_send_packet_now(s_cid_control)) {
+            uint8_t hs = s_pending_handshake;
+            s_pending_handshake = 0xff;
+            l2cap_send(s_cid_control, &hs, 1);
+        } else {
+            l2cap_request_can_send_now_event(s_cid_control);
+        }
+    }
+
+    if (!s_link_up || s_cid_interrupt == 0) {
         return;
     }
 
     now = (uint32_t)(esp_timer_get_time() / 1000);
-    wiimote_lock();
-    proto = wiimote_state();
+    while (budget-- > 0) {
+        int n;
+        bool more_queued;
+        wiimote_proto_t *proto;
 
-    /* 1. Drain any queued protocol responses (status reports, memory read/write ACKs).
-     *    These are required by the Wii handshake and must be sent promptly. */
-    while (s_cid_interrupt != 0 && (proto->q_count > 0 || proto->read.active)) {
         if (!l2cap_can_send_packet_now(s_cid_interrupt)) {
-            l2cap_request_can_send_now_event(s_cid_interrupt);
-            leds = proto->leds;
-            rumble = proto->rumble;
+            wiimote_lock();
+            proto = wiimote_state();
+            more_queued = proto->q_count > 0 || proto->read.active;
             wiimote_unlock();
-            note_outputs(leds, rumble);
-            return;
-        }
-        n = wiimote_proto_poll(proto, pkt, sizeof(pkt), now);
-        if (n <= 0) {
+            /* Only protocol replies (acks, status, memory reads) ask to be
+             * woken up. Periodic input waits for the next timer tick, which
+             * keeps the console link from monopolising the radio. */
+            if (more_queued) {
+                l2cap_request_can_send_now_event(s_cid_interrupt);
+            }
             break;
         }
-        leds = proto->leds;
-        rumble = proto->rumble;
-        wiimote_unlock();
-
-        l2cap_send(s_cid_interrupt, pkt, (uint16_t)n);
-        note_outputs(leds, rumble);
 
         wiimote_lock();
         proto = wiimote_state();
+        n = wiimote_proto_poll(proto, pkt, sizeof(pkt), now);
+        leds = proto->leds;
+        rumble = proto->rumble;
+        have_outputs = true;
+        wiimote_unlock();
+
+        if (n <= 0) {
+            break;
+        }
+        l2cap_send(s_cid_interrupt, pkt, (uint16_t)n);
     }
 
-    /* 2. Send at most ONE periodic input report per call, and NEVER request
-     *    L2CAP_EVENT_CAN_SEND_NOW for continuous input reports. Requesting CAN_SEND_NOW
-     *    for continuous input reports creates a back-to-back Slave TX chain on the Wii
-     *    link that starves the ESP32 Bluetooth Master piconet (gamepad link). */
-    if (s_cid_interrupt != 0 && l2cap_can_send_packet_now(s_cid_interrupt)) {
-        uint32_t min_interval_ms = 10;
-        if (s_gamepad_connecting) {
-            min_interval_ms = 50;
-        } else if (s_outbound_busy_until_us > 0) {
-            min_interval_ms = 40;
-        } else if (s_gamepad_handle != HCI_CON_HANDLE_INVALID) {
-            /* Scatternet coexistence: send changed inputs at up to 40 Hz (25 ms)
-             * and unchanged keepalive frames at 25 Hz (40 ms) so the ESP32 radio
-             * spends >80% of slots servicing the Master gamepad link without latency. */
-            min_interval_ms = proto->have_last_payload ? 40 : 25;
-        }
-        if ((uint32_t)(now - s_last_input_tx_ms) >= min_interval_ms) {
-            n = wiimote_proto_poll(proto, pkt, sizeof(pkt), now);
-            if (n > 0) {
-                s_last_input_tx_ms = now;
-                leds = proto->leds;
-                rumble = proto->rumble;
-                wiimote_unlock();
-
-                l2cap_send(s_cid_interrupt, pkt, (uint16_t)n);
-                note_outputs(leds, rumble);
-                return;
-            }
-        }
+    if (have_outputs) {
+        note_outputs(leds, rumble);
     }
-
-    leds = proto->leds;
-    rumble = proto->rumble;
-    wiimote_unlock();
-    note_outputs(leds, rumble);
 }
 
-static void handle_hid(const uint8_t *data, size_t len)
+static void deliver_output(const uint8_t *report, size_t len)
 {
-    const uint8_t *report = data;
-    size_t report_len = len;
+    uint8_t level;
+    if (len < 1 || report[0] < 0x10 || report[0] > 0x1a) {
+        return;
+    }
+    /* One line per configuration request; the frequent ones stay quiet. */
+    switch (report[0]) {
+    case 0x12:
+        if (len >= 3) {
+            ESP_LOGI(TAG, "Wii: report mode 0x%02x%s", report[2], (report[1] & 0x04) ? " (continuous)" : "");
+        }
+        break;
+    case 0x16:
+        if (len >= 6) {
+            ESP_LOGI(TAG, "Wii: write %s 0x%02x%02x%02x len %u first 0x%02x", (report[1] & 0x0c) ? "reg" : "eeprom",
+                     report[2], report[3], report[4], report[5], len >= 7 ? report[6] : 0);
+        }
+        break;
+    case 0x17:
+        if (len >= 7) {
+            ESP_LOGI(TAG, "Wii: read %s 0x%02x%02x%02x len %u", (report[1] & 0x0c) ? "reg" : "eeprom", report[2],
+                     report[3], report[4], (unsigned)((report[5] << 8) | report[6]));
+        }
+        break;
+    case 0x13:
+    case 0x15:
+    case 0x1a:
+        ESP_LOGI(TAG, "Wii: report 0x%02x", report[0]);
+        break;
+    default:
+        break;
+    }
+    level = wiimote_current_battery();
+    wiimote_lock();
+    wiimote_proto_set_battery(wiimote_state(), level);
+    wiimote_proto_handle_output(wiimote_state(), report, len);
+    wiimote_unlock();
+}
+
+static void send_handshake(uint8_t code)
+{
+    s_pending_handshake = code;
+}
+
+static void handle_hid(uint16_t cid, const uint8_t *data, size_t len)
+{
+    uint8_t type;
+    uint8_t param;
 
     if (len < 1 || !wiimote_ready()) {
         return;
     }
+    type = data[0] >> 4;
+    param = data[0] & 0x0f;
 
-    if (data[0] == 0xa2 || data[0] == 0x52) {
-        report = data + 1;
-        report_len = len - 1;
-    } else if ((data[0] & 0xf0) == 0x40 && len >= 2) {
-        uint8_t built[32];
-        int n;
-        wiimote_lock();
-        n = wiimote_proto_build(wiimote_state(), data[1], built, sizeof(built));
-        wiimote_unlock();
-        if (n > 0) {
-            uint16_t target_cid = s_cid_interrupt ? s_cid_interrupt : s_cid_control;
-            if (target_cid && l2cap_can_send_packet_now(target_cid)) {
-                l2cap_send(target_cid, built, (uint16_t)n);
-            }
+    if (cid == s_cid_interrupt) {
+        /* DATA | OUTPUT (0xA2) is how the Wii talks to a remote. */
+        if (data[0] == 0xa2) {
+            deliver_output(data + 1, len - 1);
         }
-        return;
-    } else if (data[0] < 0x10 || data[0] > 0x1a) {
+        flush_reports();
         return;
     }
 
-    {
-        uint8_t level = wiimote_current_battery();
-        wiimote_lock();
-        wiimote_proto_set_battery(wiimote_state(), level);
-        wiimote_proto_handle_output(wiimote_state(), report, report_len);
-        wiimote_unlock();
+    /* Control channel. */
+    switch (type) {
+    case 0x1: /* HID_CONTROL */
+        if (param == 0x05) {
+            ESP_LOGI(TAG, "Console sent VIRTUAL_CABLE_UNPLUG");
+            if (s_link_handle != HCI_CON_HANDLE_INVALID) {
+                gap_disconnect(s_link_handle);
+            }
+        }
+        return;
+    case 0x5: /* SET_REPORT */
+        if ((param & 0x03) == 0x02) {
+            deliver_output(data + 1, len - 1);
+            send_handshake(0x00);
+        } else {
+            send_handshake(0x03);
+        }
+        break;
+    case 0xa: /* DATA on control */
+        if (param == 0x02) {
+            deliver_output(data + 1, len - 1);
+        }
+        break;
+    default: /* GET_REPORT, GET/SET_PROTOCOL, ... are not used by the Wii */
+        send_handshake(0x03);
+        break;
     }
     flush_reports();
 }
 
-#define WM_CMD_STOP_INQUIRY        (1u << 0)
-#define WM_CMD_DELETE_LINK_KEYS    (1u << 1)
-#define WM_CMD_INQ_SCAN_INTERLACED (1u << 2)
-#define WM_CMD_WRITE_LIAC          (1u << 3)
+/* ---------------------------------------------------------- link setup -- */
 
-static uint32_t s_pending_cmds = 0;
-
-static void pump_pending_cmds(void)
+static void on_channels_up(void)
 {
-    if (s_pending_cmds == 0) {
+    if (s_link_up) {
         return;
     }
-    if (hci_get_state() != HCI_STATE_WORKING || !hci_can_send_command_packet_now()) {
-        return;
+    s_link_up = true;
+    if (s_sync_active) {
+        s_sync_active = false;
+        gap_discoverable_control(0);
+        scan_activity_normal();
     }
-
-    if (s_pending_cmds & WM_CMD_STOP_INQUIRY) {
-        s_pending_cmds &= ~WM_CMD_STOP_INQUIRY;
-        gap_inquiry_stop();
-        if (!hci_can_send_command_packet_now()) {
-            return;
-        }
-    }
-    if (s_pending_cmds & WM_CMD_DELETE_LINK_KEYS) {
-        bd_addr_t zero_addr = {0};
-        s_pending_cmds &= ~WM_CMD_DELETE_LINK_KEYS;
-        hci_send_cmd(&hci_delete_stored_link_key, zero_addr, 1);
-        return;
-    }
-    if (s_pending_cmds & WM_CMD_INQ_SCAN_INTERLACED) {
-        s_pending_cmds &= ~WM_CMD_INQ_SCAN_INTERLACED;
-        hci_send_cmd(&hci_write_inquiry_scan_type, 1);
-        return;
-    }
-    if (s_pending_cmds & WM_CMD_WRITE_LIAC) {
-        s_pending_cmds &= ~WM_CMD_WRITE_LIAC;
-        hci_send_cmd(&hci_write_current_iac_lap_two_iacs, 2, GAP_IAC_LIMITED_INQUIRY, GAP_IAC_GENERAL_INQUIRY);
-        return;
-    }
+    store_host(s_link_addr);
+    ESP_LOGI(TAG, "Console %s connected (control cid 0x%04x, interrupt cid 0x%04x, %s)", bd_addr_to_str(s_link_addr),
+             s_cid_control, s_cid_interrupt, s_link_outgoing ? "we paged it" : "it paged us");
+    report_timer_start();
+    btstack_run_loop_remove_timer(&s_connect_watchdog);
+    /* No role switch request here: a Wii refuses it (0x0c) only after ~17 s,
+     * and the link carries no data while the request is pending. The Wii is
+     * master of its link, exactly as with a real remote. */
+    wiimote_set_connected(true);
 }
 
-static void report_timer_cb(btstack_timer_source_t *ts)
+static void connect_watchdog_cb(btstack_timer_source_t *ts)
 {
-    int64_t now = esp_timer_get_time();
-
-    if (s_name_req_pending && now >= s_name_req_cancel_at_us) {
-        if (hci_get_state() == HCI_STATE_WORKING && hci_can_send_command_packet_now()) {
-            s_name_req_pending = false;
-            s_name_req_cancel_at_us = 0;
-            ESP_LOGW(TAG, "Cancelling slow HCI_Remote_Name_Request before L2CAP connect");
-            hci_send_cmd(&hci_remote_name_request_cancel, s_gamepad_addr);
-            btstack_run_loop_set_timer(ts, 10);
-            btstack_run_loop_add_timer(ts);
-            return;
-        }
+    (void)ts;
+    if (!s_link_claimed || s_link_up || !s_link_outgoing) {
+        return;
     }
-
-    if (s_outbound_busy_until_us > 0 && now >= s_outbound_busy_until_us) {
-        s_outbound_busy_until_us = 0;
-        if (s_gamepad_connecting) {
-            if (s_gamepad_handle != HCI_CON_HANDLE_INVALID) {
-                s_gamepad_connecting = false;
-                s_gamepad_connected = true;
-            } else {
-                if (hci_get_state() == HCI_STATE_WORKING && hci_can_send_command_packet_now()) {
-                    s_gamepad_connecting = false;
-                    ESP_LOGI(TAG, "Gamepad connection attempt timed out; cancelling page & resuming scan");
-                    hci_send_cmd(&hci_create_connection_cancel, s_gamepad_addr);
-                    resume_gamepad_scanning();
-                    btstack_run_loop_set_timer(ts, 10);
-                    btstack_run_loop_add_timer(ts);
-                    return;
-                }
-                /* Wait until next tick if command buffer is currently busy */
-                s_outbound_busy_until_us = now + 20000LL;
-            }
-        }
+    ESP_LOGW(TAG, "Connecting to the console timed out; giving up for now");
+    if (s_link_handle != HCI_CON_HANDLE_INVALID) {
+        gap_disconnect(s_link_handle);
+        return; /* DISCONNECTION_COMPLETE releases the link. */
     }
-
+    memcpy(s_cancel_addr, s_link_addr, BD_ADDR_LEN);
+    s_pending_cmds |= WM_CMD_CANCEL_PAGE;
     pump_pending_cmds();
-    flush_reports();
-    btstack_run_loop_set_timer(ts, 10);
-    btstack_run_loop_add_timer(ts);
+    release_link();
 }
 
-static void wiimote_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
+static void start_outgoing(void)
 {
-    if (packet_type == HCI_EVENT_PACKET) {
-        uint8_t event = hci_event_packet_get_type(packet);
-        switch (event) {
-        case HCI_EVENT_COMMAND_COMPLETE: {
-            uint16_t opcode = hci_event_command_complete_get_command_opcode(packet);
-            const uint8_t *ret = hci_event_command_complete_get_return_parameters(packet);
-            uint8_t status = ret ? ret[0] : 0xff;
-            if (opcode == HCI_OPCODE_HCI_PERIODIC_INQUIRY_MODE &&
-                (s_sync_window || s_gamepad_connecting || s_gamepad_connected)) {
-                ESP_LOGI(TAG, "Stopping periodic inquiry (sync=%d connecting=%d connected=%d)",
-                         s_sync_window, s_gamepad_connecting, s_gamepad_connected);
-                gap_inquiry_stop();
-            } else if (opcode == HCI_OPCODE_HCI_WRITE_CURRENT_IAC_LAP_TWO_IACS) {
-                ESP_LOGI(TAG, "HCI_Write_Current_IAC_LAP status=0x%02x (LIAC 0x9E8B00 + GIAC 0x9E8B33)", status);
-            }
-            break;
+    uint8_t status;
+    if (!s_have_host) {
+        ESP_LOGW(TAG, "Connect requested, but no console has been synced yet");
+        return;
+    }
+    if (s_link_claimed) {
+        return; /* Already connecting or connected. */
+    }
+    claim_link(s_host_addr, true);
+    if (s_fallback != NULL) {
+        /* Sharing the radio with a gamepad: a Wii takes over as master while
+         * the connection is set up, if allowed. As slave on the Wii link and
+         * master on the gamepad link the ESP32 controller stalls both links
+         * (gamepad supervision timeout 0x08). So page with role switch off:
+         * the ESP32 stays master of both, one piconet. */
+        gap_set_allow_role_switch(false);
+        s_restore_role_switch = true;
+    }
+    status = l2cap_create_channel(wm_l2cap_handler, s_host_addr, WM_PSM_CONTROL, WM_L2CAP_MTU, &s_cid_control);
+    if (status != ERROR_CODE_SUCCESS) {
+        ESP_LOGW(TAG, "Paging console failed to start (0x%02x)", status);
+        s_cid_control = 0;
+        s_link_claimed = false;
+        return;
+    }
+    ESP_LOGI(TAG, "Paging console %s", bd_addr_to_str(s_host_addr));
+    /* The controller can lose a page when another one (a gamepad) starts at
+     * the same time, and then never reports it. Do not wait forever. */
+    btstack_run_loop_set_timer_handler(&s_connect_watchdog, connect_watchdog_cb);
+    btstack_run_loop_set_timer(&s_connect_watchdog, WM_CONNECT_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&s_connect_watchdog);
+}
+
+static void drop_link(void)
+{
+    if (!s_link_claimed) {
+        return;
+    }
+    if (s_link_handle != HCI_CON_HANDLE_INVALID) {
+        /* Hang up like a remote that is switched off. */
+        s_poweroff_handle = s_link_handle;
+        s_pending_cmds |= WM_CMD_POWER_OFF_DISCONNECT;
+        pump_pending_cmds();
+        return; /* DISCONNECTION_COMPLETE releases the link. */
+    }
+    if (s_cid_interrupt) {
+        l2cap_disconnect(s_cid_interrupt);
+    }
+    if (s_cid_control) {
+        l2cap_disconnect(s_cid_control);
+    }
+    release_link();
+}
+
+/* ------------------------------------------------------- L2CAP handler -- */
+
+static void forward(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
+{
+    if (s_fallback != NULL) {
+        s_fallback(packet_type, channel, packet, size);
+    }
+}
+
+static bool is_our_cid(uint16_t cid)
+{
+    return cid != 0 && (cid == s_cid_control || cid == s_cid_interrupt);
+}
+
+static void wm_l2cap_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
+{
+    if (packet_type == L2CAP_DATA_PACKET) {
+        if (is_our_cid(channel)) {
+            handle_hid(channel, packet, size);
+        } else {
+            forward(packet_type, channel, packet, size);
         }
-        case GAP_EVENT_INQUIRY_RESULT: {
-            bd_addr_t addr;
-            uint32_t cod = gap_event_inquiry_result_get_class_of_device(packet);
-            gap_event_inquiry_result_get_bd_addr(packet, addr);
-            if (!s_sync_window && ((cod & 0x1f00u) == 0x0500u)) {
-                if (s_gamepad_connected || (s_gamepad_connecting && bd_addr_cmp(addr, s_gamepad_addr) != 0)) {
-                    /* Ignore additional controllers while one is already connecting or connected
-                     * so concurrent HCI_Remote_Name_Request / HCI_Create_Connection calls do not collide. */
-                    packet[0] = HCI_EVENT_NOP;
-                    break;
-                }
-                if (!s_gamepad_connecting) {
-                    s_gamepad_connecting = true;
-                    memcpy(s_gamepad_addr, addr, 6);
-                    s_outbound_busy_until_us = esp_timer_get_time() + 14000000LL;
-                    if (!gap_event_inquiry_result_get_name_available(packet)) {
-                        s_name_req_pending = true;
-                        s_name_req_cancel_at_us = esp_timer_get_time() + 3800000LL;
-                    }
-                    pause_gamepad_scanning();
-                    ESP_LOGI(TAG, "Gamepad %02x:%02x:%02x:%02x:%02x:%02x discovered; paused inquiry & BLE scan for connection",
-                             addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-                }
-            }
-            break;
-        }
-        case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE: {
-            s_name_req_pending = false;
-            s_name_req_cancel_at_us = 0;
-            break;
-        }
-        case HCI_EVENT_CONNECTION_REQUEST: {
-            bd_addr_t addr;
-            uint32_t cod = hci_event_connection_request_get_class_of_device(packet);
-            uint8_t link_type = hci_event_connection_request_get_link_type(packet);
-            hci_event_connection_request_get_bd_addr(packet, addr);
-            ESP_LOGI(TAG, "HCI connection request from %02x:%02x:%02x:%02x:%02x:%02x cod=0x%06lx link_type=%u",
-                     addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
-                     (unsigned long)cod, (unsigned)link_type);
-            if ((cod & 0x1f00u) != 0x0500u) {
-                /* Connecting peer is a host/console (e.g. Nintendo Wii, cod=0x000448).
-                 * Accept inbound ACL as slave so the Wii console remains master, and consume
-                 * the event so Bluepad32 does not allocate a gamepad slot for the Wii. */
-                hci_set_master_slave_policy(HCI_ROLE_SLAVE);
-                memcpy(s_bda, addr, 6);
-                s_have_host_bda = true;
-                packet[0] = HCI_EVENT_NOP;
-            } else {
-                /* Connecting peer is a peripheral gamepad: become master as Bluepad32 expects. */
-                hci_set_master_slave_policy(HCI_ROLE_MASTER);
-                s_gamepad_connecting = true;
-                memcpy(s_gamepad_addr, addr, 6);
-                s_outbound_busy_until_us = esp_timer_get_time() + 10000000LL;
-                pause_gamepad_scanning();
-            }
-            break;
-        }
-        case HCI_EVENT_CONNECTION_COMPLETE: {
-            bd_addr_t addr;
-            uint8_t status = hci_event_connection_complete_get_status(packet);
-            uint16_t handle = hci_event_connection_complete_get_connection_handle(packet);
-            hci_event_connection_complete_get_bd_addr(packet, addr);
-            ESP_LOGI(TAG, "HCI connection complete from %02x:%02x:%02x:%02x:%02x:%02x handle=0x%04x status=0x%02x",
-                     addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
-                     handle, status);
-            if (is_wii_host_addr(addr)) {
-                if (status == ERROR_CODE_SUCCESS) {
-                    s_con_handle = handle;
-                }
-                if (uni_bt_packet_handler != NULL) {
-                    packet[0] = HCI_EVENT_NOP;
-                }
-            } else {
-                s_name_req_pending = false;
-                s_name_req_cancel_at_us = 0;
-                if (status == ERROR_CODE_SUCCESS) {
-                    s_gamepad_handle = handle;
-                    s_gamepad_connected = true;
-                    s_gamepad_connecting = false;
-                    s_outbound_busy_until_us = esp_timer_get_time() + 4000000LL;
-                    pause_gamepad_scanning();
-                } else {
-                    s_gamepad_connecting = false;
-                    s_gamepad_connected = false;
-                    s_gamepad_handle = HCI_CON_HANDLE_INVALID;
-                    s_outbound_busy_until_us = 0;
-                    ESP_LOGI(TAG, "Gamepad ACL connection failed (status=0x%02x); resuming scan", status);
-                    resume_gamepad_scanning();
-                }
-            }
-            break;
-        }
-        case L2CAP_EVENT_INCOMING_CONNECTION: {
-            uint16_t psm = l2cap_event_incoming_connection_get_psm(packet);
-            uint16_t cid = l2cap_event_incoming_connection_get_local_cid(packet);
-            bd_addr_t addr;
-            l2cap_event_incoming_connection_get_address(packet, addr);
-            if (!is_wii_host_addr(addr)) {
-                if (uni_bt_packet_handler != NULL) {
-                    uni_bt_packet_handler(packet_type, channel, packet, size);
-                } else {
-                    l2cap_decline_connection(cid);
-                }
-                break;
-            }
-            ESP_LOGI(TAG, "L2CAP incoming connection PSM 0x%04x cid %u from %02x:%02x:%02x:%02x:%02x:%02x",
-                     psm, cid, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-            if (psm == 0x0011 || psm == 0x0013) {
-                memcpy(s_bda, addr, 6);
-                s_have_host_bda = true;
-                l2cap_accept_connection(cid);
+        return;
+    }
+    if (packet_type != HCI_EVENT_PACKET) {
+        forward(packet_type, channel, packet, size);
+        return;
+    }
+
+    switch (hci_event_packet_get_type(packet)) {
+    case L2CAP_EVENT_INCOMING_CONNECTION: {
+        bd_addr_t addr;
+        uint16_t psm = l2cap_event_incoming_connection_get_psm(packet);
+        uint16_t cid = l2cap_event_incoming_connection_get_local_cid(packet);
+        hci_con_handle_t handle = l2cap_event_incoming_connection_get_handle(packet);
+        l2cap_event_incoming_connection_get_address(packet, addr);
+        if (!is_console_link_addr(addr) && !is_console(addr, 0, false)) {
+            if (s_fallback != NULL) {
+                forward(packet_type, channel, packet, size);
             } else {
                 l2cap_decline_connection(cid);
             }
-            break;
+            return;
         }
-        case L2CAP_EVENT_CHANNEL_OPENED: {
-            uint8_t status = l2cap_event_channel_opened_get_status(packet);
-            uint16_t cid = l2cap_event_channel_opened_get_local_cid(packet);
-            uint16_t psm = l2cap_event_channel_opened_get_psm(packet);
-            bd_addr_t addr;
-            l2cap_event_channel_opened_get_address(packet, addr);
-            if (!is_wii_host_addr(addr)) {
-                if (uni_bt_packet_handler != NULL) {
-                    uni_bt_packet_handler(packet_type, channel, packet, size);
-                }
-                break;
-            }
-            if (status != ERROR_CODE_SUCCESS) {
-                ESP_LOGE(TAG, "L2CAP channel open failed: status 0x%02x cid %u", status, cid);
-                break;
-            }
-            s_con_handle = l2cap_event_channel_opened_get_handle(packet);
-            ESP_LOGI(TAG, "L2CAP channel open: PSM 0x%04x cid %u", psm, cid);
-            if (psm == 0x0011) {
-                s_cid_control = cid;
-            } else if (psm == 0x0013) {
-                s_cid_interrupt = cid;
-            }
-            if (s_cid_control != 0 && s_cid_interrupt != 0) {
-                /* Close sync window BEFORE invoking wiimote_set_connected(true) so that
-                 * if the connected callback starts Bluepad32 periodic inquiry, s_sync_window
-                 * is already false and does not cancel the newly started inquiry! */
-                s_sync_window = false;
-                s_pending_cmds &= ~WM_CMD_STOP_INQUIRY;
-                gap_discoverable_control(0);
-                gap_connectable_control(0);
-                gap_set_page_scan_activity(0x0800, 0x0012);
-                gap_inquiry_set_scan_activity(0x0800, 0x0012);
-                /* Set page timeout to 6.4s (0x2800 slots) instead of BTstack's 15.36s default
-                 * so a missed page fails and cleans up well before Bluepad32's 20s timeout. */
-                gap_set_page_timeout(0x2800);
-                if (uni_bt_packet_handler != NULL) {
-                    /* Reduce BLE scan duty cycle from 100% (48/48) to 12.5% (48/384)
-                     * so BLE scanning does not starve BR/EDR inquiry & paging while connected to Wii. */
-                    gap_set_scan_parameters(0, 0x0180, 0x0030);
-                }
-                ESP_LOGI(TAG, "Wiimote connected to Wii console (Control & Interrupt channels open)");
-                wiimote_set_connected(true);
-            }
-            break;
+        if (!s_link_claimed) {
+            claim_link(addr, false);
         }
-        case L2CAP_EVENT_CHANNEL_CLOSED: {
-            uint16_t cid = l2cap_event_channel_closed_get_local_cid(packet);
-            if (cid != s_cid_control && cid != s_cid_interrupt) {
-                if (uni_bt_packet_handler != NULL) {
-                    uni_bt_packet_handler(packet_type, channel, packet, size);
-                }
-                break;
-            }
-            ESP_LOGI(TAG, "L2CAP channel closed: cid %u", cid);
-            if (cid == s_cid_control) s_cid_control = 0;
-            if (cid == s_cid_interrupt) s_cid_interrupt = 0;
-            if (s_cid_interrupt == 0) {
-                gap_connectable_control(1);
-                wiimote_set_connected(false);
-            }
-            break;
+        s_link_handle = handle;
+        if (psm == WM_PSM_CONTROL && s_cid_control == 0) {
+            s_cid_control = cid;
+            l2cap_accept_connection(cid);
+        } else if (psm == WM_PSM_INTERRUPT && s_cid_interrupt == 0) {
+            s_cid_interrupt = cid;
+            l2cap_accept_connection(cid);
+        } else {
+            ESP_LOGW(TAG, "Declining duplicate/unknown PSM 0x%04x from console", psm);
+            l2cap_decline_connection(cid);
         }
-        case L2CAP_EVENT_CAN_SEND_NOW: {
-            uint16_t cid = l2cap_event_can_send_now_get_local_cid(packet);
-            if (cid == s_cid_interrupt || cid == s_cid_control) {
-                flush_reports();
-            } else if (uni_bt_packet_handler != NULL) {
-                uni_bt_packet_handler(packet_type, channel, packet, size);
-            }
-            break;
+        return;
+    }
+    case L2CAP_EVENT_CHANNEL_OPENED: {
+        uint16_t cid = l2cap_event_channel_opened_get_local_cid(packet);
+        uint8_t status = l2cap_event_channel_opened_get_status(packet);
+        uint16_t psm = l2cap_event_channel_opened_get_psm(packet);
+        if (!is_our_cid(cid)) {
+            forward(packet_type, channel, packet, size);
+            return;
         }
-        case HCI_EVENT_PIN_CODE_REQUEST: {
-            /* gap_pin_code_response_binary stores the pointer without copying, so s_pin must be static */
-            static uint8_t s_pin[6];
-            bd_addr_t addr;
-            hci_event_pin_code_request_get_bd_addr(packet, addr);
-            if (is_wii_host_addr(addr)) {
-                ESP_LOGI(TAG, "PIN request from %02x:%02x:%02x:%02x:%02x:%02x, reply reversed peer BD_ADDR (6 bytes)",
-                         addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-                for (int i = 0; i < 6; i++) {
-                    s_pin[i] = addr[5 - i];
-                }
-                gap_pin_code_response_binary(addr, s_pin, 6);
-                /* Consume event so Bluepad32's uni_bt_bredr_on_hci_pin_code_request does not overwrite the PIN */
-                packet[0] = HCI_EVENT_NOP;
-            }
-            break;
-        }
-        case HCI_EVENT_LINK_KEY_NOTIFICATION: {
-            bd_addr_t addr;
-            reverse_bd_addr(&packet[2], addr);
-            ESP_LOGI(TAG, "Link key stored for %02x:%02x:%02x:%02x:%02x:%02x",
-                     addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
-            break;
-        }
-        case HCI_EVENT_DISCONNECTION_COMPLETE: {
-            uint16_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
-            uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
-            if (s_con_handle != HCI_CON_HANDLE_INVALID && handle == s_con_handle) {
-                ESP_LOGI(TAG, "Wii HCI disconnection complete: handle 0x%04x reason 0x%02x", handle, reason);
-                s_con_handle = HCI_CON_HANDLE_INVALID;
+        if (status != ERROR_CODE_SUCCESS) {
+            ESP_LOGW(TAG, "Console channel PSM 0x%04x failed (status 0x%02x)", psm, status);
+            if (cid == s_cid_control) {
                 s_cid_control = 0;
+            } else {
                 s_cid_interrupt = 0;
-                gap_connectable_control(1);
-                wiimote_set_connected(false);
-            } else if (s_gamepad_handle != HCI_CON_HANDLE_INVALID && handle == s_gamepad_handle) {
-                s_gamepad_handle = HCI_CON_HANDLE_INVALID;
-                s_outbound_busy_until_us = 0;
-                if (s_gamepad_connected || s_gamepad_connecting) {
-                    s_gamepad_connected = false;
-                    s_gamepad_connecting = false;
-                    ESP_LOGI(TAG, "Gamepad disconnected (handle 0x%04x reason 0x%02x); resuming scan", handle, reason);
-                    resume_gamepad_scanning();
-                }
             }
-            break;
+            /* Outgoing: the page or the channel failed. Incoming: the
+             * console gives up and drops the ACL itself. */
+            if (s_link_outgoing) {
+                drop_link();
+            }
+            return;
         }
-        default:
-            break;
+        s_link_handle = l2cap_event_channel_opened_get_handle(packet);
+        if (cid == s_cid_control) {
+            s_control_open = true;
+        } else {
+            s_interrupt_open = true;
         }
-        pump_pending_cmds();
-    } else if (packet_type == L2CAP_DATA_PACKET) {
-        if (channel == s_cid_control || channel == s_cid_interrupt) {
-            handle_hid(packet, size);
-        } else if (uni_bt_packet_handler != NULL) {
-            uni_bt_packet_handler(packet_type, channel, packet, size);
+        ESP_LOGI(TAG, "Console channel PSM 0x%04x open (cid 0x%04x)", psm, cid);
+        if (s_link_outgoing && cid == s_cid_control && s_cid_interrupt == 0) {
+            /* A real remote opens control first, then interrupt. */
+            uint8_t st = l2cap_create_channel(wm_l2cap_handler, s_link_addr, WM_PSM_INTERRUPT, WM_L2CAP_MTU,
+                                              &s_cid_interrupt);
+            if (st != ERROR_CODE_SUCCESS) {
+                ESP_LOGW(TAG, "Opening interrupt channel failed (0x%02x)", st);
+                s_cid_interrupt = 0;
+                drop_link();
+            }
         }
+        if (s_control_open && s_interrupt_open) {
+            on_channels_up();
+        }
+        return;
+    }
+    case L2CAP_EVENT_CHANNEL_CLOSED: {
+        uint16_t cid = l2cap_event_channel_closed_get_local_cid(packet);
+        if (!is_our_cid(cid)) {
+            forward(packet_type, channel, packet, size);
+            return;
+        }
+        ESP_LOGI(TAG, "Console channel cid 0x%04x closed", cid);
+        if (cid == s_cid_control) {
+            s_cid_control = 0;
+            s_control_open = false;
+        } else {
+            s_cid_interrupt = 0;
+            s_interrupt_open = false;
+        }
+        if (s_cid_control == 0 && s_cid_interrupt == 0) {
+            if (s_link_handle != HCI_CON_HANDLE_INVALID) {
+                /* Mirror a real remote: no HID channels, no baseband link. */
+                gap_disconnect(s_link_handle);
+            } else {
+                release_link();
+            }
+        } else if (s_link_up) {
+            /* Half a link is useless; tell the app now. */
+            s_link_up = false;
+            report_timer_stop();
+            wiimote_set_connected(false);
+        }
+        return;
+    }
+    case L2CAP_EVENT_CAN_SEND_NOW: {
+        uint16_t cid = l2cap_event_can_send_now_get_local_cid(packet);
+        if (is_our_cid(cid)) {
+            flush_reports();
+        } else {
+            forward(packet_type, channel, packet, size);
+        }
+        return;
+    }
+    default:
+        forward(packet_type, channel, packet, size);
+        return;
     }
 }
 
-static void register_hid_services_main_thread(void *context)
+/* --------------------------------------------------------- HCI handler -- */
+
+static void wm_hci_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
 {
-    (void)context;
-    if (s_hid_ready) {
+    (void)channel;
+    (void)size;
+    if (packet_type != HCI_EVENT_PACKET) {
         return;
     }
 
-    s_hid_handle = sdp_create_service_record_handle();
-    int rlen = build_hid_sdp_record(s_hid_sdp_record, sizeof(s_hid_sdp_record), s_hid_handle);
-    if (rlen > 0) {
-        sdp_register_service(s_hid_sdp_record);
-        ESP_LOGI(TAG, "Registered RVL-CNT-01 HID SDP record (len %d)", rlen);
-    } else {
-        ESP_LOGE(TAG, "Failed to build RVL-CNT-01 HID SDP record");
+    switch (hci_event_packet_get_type(packet)) {
+    case BTSTACK_EVENT_STATE:
+        if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+            on_hci_working();
+        }
+        break;
+
+    case HCI_EVENT_COMMAND_COMPLETE: {
+        uint16_t opcode = hci_event_command_complete_get_command_opcode(packet);
+        if (opcode == HCI_OPCODE_HCI_WRITE_CURRENT_IAC_LAP_TWO_IACS) {
+            const uint8_t *ret = hci_event_command_complete_get_return_parameters(packet);
+            ESP_LOGI(TAG, "IAC LAPs LIAC+GIAC written (status 0x%02x)", ret ? ret[0] : 0xff);
+        }
+        break;
     }
 
-    /* Remove Bluepad32's default Device ID record (0x10003) if present so only Nintendo's is advertised */
-    sdp_unregister_service(0x10003);
+    case HCI_EVENT_COMMAND_STATUS: {
+        /* QoS Setup answers with Command Status first; an error ends it. */
+        if (hci_event_command_status_get_command_opcode(packet) == HCI_OPCODE_HCI_QOS_SETUP &&
+            hci_event_command_status_get_status(packet) != ERROR_CODE_SUCCESS &&
+            s_qos_inflight_handle != HCI_CON_HANDLE_INVALID) {
+            hci_con_handle_t h = s_qos_inflight_handle;
+            s_qos_inflight_handle = HCI_CON_HANDLE_INVALID;
+            qos_failed(h, hci_event_command_status_get_status(packet));
+        }
+        break;
+    }
 
-    s_device_id_handle = sdp_create_service_record_handle();
-    device_id_create_sdp_record(
-        s_device_id_sdp_record,
-        s_device_id_handle,
-        DEVICE_ID_VENDOR_ID_SOURCE_BLUETOOTH,
-        0x057E, /* Nintendo */
-        0x0306, /* RVL-CNT-01 */
-        0x0100  /* Version 1.0.0 */
-    );
-    sdp_register_service(s_device_id_sdp_record);
+    case HCI_EVENT_QOS_SETUP_COMPLETE: {
+        if (size < 23) {
+            break;
+        }
+        uint8_t status = packet[2];
+        hci_con_handle_t h = little_endian_read_16(packet, 3) & 0x0fff;
+        s_qos_inflight_handle = HCI_CON_HANDLE_INVALID;
+        if (status != ERROR_CODE_SUCCESS) {
+            qos_failed(h, status);
+        } else {
+            /* The granted latency is the controller's poll interval. */
+            ESP_LOGI(TAG, "QoS on 0x%04x (%s): granted latency %lu us (asked %u)", h,
+                     (s_link_claimed && h == s_link_handle) ? "console" : "gamepad",
+                     (unsigned long)little_endian_read_32(packet, 15), (unsigned)WIIMOTE_QOS_LATENCY_US);
+        }
+        break;
+    }
 
-    gap_set_local_name("Nintendo RVL-CNT-01");
-    gap_set_class_of_device(0x002504);
-    gap_set_security_mode(GAP_SECURITY_MODE_2);
-    gap_ssp_set_auto_accept(true);
-    gap_set_allow_role_switch(true);
-    hci_set_master_slave_policy(HCI_ROLE_SLAVE);
-    gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_HOLD_MODE |
-                                         LM_LINK_POLICY_ENABLE_SNIFF_MODE);
+    case HCI_EVENT_CONNECTION_REQUEST: {
+        bd_addr_t addr;
+        uint32_t cod = hci_event_connection_request_get_class_of_device(packet);
+        hci_link_type_t link_type = (hci_link_type_t)hci_event_connection_request_get_link_type(packet);
+        hci_event_connection_request_get_bd_addr(packet, addr);
+        if (link_type != HCI_LINK_TYPE_ACL) {
+            break;
+        }
+        if (is_console(addr, cod, true)) {
+            if (s_link_claimed && !addr_eq(addr, s_link_addr)) {
+                ESP_LOGW(TAG, "Second console %s while %s is active; it will not get HID channels",
+                         bd_addr_to_str(addr), bd_addr_to_str(s_link_addr));
+            } else {
+                ESP_LOGI(TAG, "Incoming ACL from console %s (cod 0x%06lx)", bd_addr_to_str(addr), (unsigned long)cod);
+                claim_link(addr, false);
+            }
+            /* Hide the console from the host stack (no device slot, no timeout). */
+            if (s_fallback != NULL) {
+                packet[0] = HCI_EVENT_NOP;
+            }
+        } else if (s_fallback != NULL && s_filter_chose_slave && addr_eq(addr, s_filter_addr)) {
+            s_role_fix_pending = true;
+            memcpy(s_role_fix_addr, addr, BD_ADDR_LEN);
+        }
+        break;
+    }
 
-    /* Ensure PSM 0x0011 and 0x0013 are free before registering (e.g. if Bluepad32 registered them) */
-    l2cap_unregister_service(0x0011);
-    l2cap_unregister_service(0x0013);
-    l2cap_register_service(wiimote_packet_handler, 0x0011, 672, LEVEL_0);
-    l2cap_register_service(wiimote_packet_handler, 0x0013, 672, LEVEL_0);
+    case HCI_EVENT_CONNECTION_COMPLETE: {
+        bd_addr_t addr;
+        uint8_t status = hci_event_connection_complete_get_status(packet);
+        hci_con_handle_t handle = hci_event_connection_complete_get_connection_handle(packet);
+        hci_event_connection_complete_get_bd_addr(packet, addr);
+        if (is_console_link_addr(addr)) {
+            if (s_restore_role_switch) {
+                s_restore_role_switch = false;
+                gap_set_allow_role_switch(true);
+            }
+            if (status == ERROR_CODE_SUCCESS) {
+                s_link_handle = handle;
+                ESP_LOGI(TAG, "ACL to console up (handle 0x%04x, ESP32 is %s)", handle,
+                         s_link_master ? "master" : "slave");
+                if (s_fallback != NULL && s_link_outgoing && s_link_master) {
+                    /* Keep it that way after setup (no role switch), no sniff. */
+                    queue_link_policy(handle, 0);
+                    /* No QoS here: as master we send to the Wii whenever we
+                     * like; the poll interval only delays its LED/rumble
+                     * reports, and the radio time is better left to the
+                     * gamepad link. */
+                }
+            } else {
+                ESP_LOGW(TAG, "ACL to console failed (status 0x%02x)", status);
+                /* Outgoing channels get L2CAP_EVENT_CHANNEL_OPENED with an
+                 * error and are released there; an incoming one just ends. */
+                if (!s_link_outgoing) {
+                    release_link();
+                }
+            }
+        } else if (s_role_fix_pending && addr_eq(addr, s_role_fix_addr)) {
+            s_role_fix_pending = false;
+            if (status == ERROR_CODE_SUCCESS) {
+                gap_request_role(addr, HCI_ROLE_MASTER);
+            }
+        }
+        if (status == ERROR_CODE_SUCCESS && s_fallback != NULL && !is_console_link_addr(addr)) {
+            /* Gamepad link: our PSM services are level 0 so the console is
+             * never challenged. Ask gamepads for what the host stack would. */
+            gap_request_security_level(handle, LEVEL_2);
+            /* Gamepad: role switch allowed, sniff not (latency). */
+            queue_link_policy(handle, LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
+            queue_qos(handle, WM_QOS_GUARANTEED);
+        }
+        break;
+    }
 
-    /* Insert handler at the head of HCI event handlers so we intercept Wii PIN requests before Bluepad32 */
-    s_hci_event_callback_registration.callback = wiimote_packet_handler;
-    hci_add_event_handler_for_security_manager(&s_hci_event_callback_registration);
+    case HCI_EVENT_PIN_CODE_REQUEST: {
+        /* gap_pin_code_response_binary keeps the pointer: must be static. */
+        static uint8_t s_pin[6];
+        bd_addr_t addr;
+        hci_event_pin_code_request_get_bd_addr(packet, addr);
+        if (!is_console_link_addr(addr) && !(s_have_host && addr_eq(addr, s_host_addr))) {
+            break;
+        }
+        for (int i = 0; i < 6; i++) {
+            s_pin[i] = addr[5 - i];
+        }
+        ESP_LOGI(TAG, "PIN request from console %s: answering with its address reversed", bd_addr_to_str(addr));
+        gap_pin_code_response_binary(addr, s_pin, sizeof(s_pin));
+        packet[0] = HCI_EVENT_NOP;
+        break;
+    }
 
-    btstack_run_loop_set_timer_handler(&s_report_timer, report_timer_cb);
-    btstack_run_loop_set_timer(&s_report_timer, 10);
-    btstack_run_loop_add_timer(&s_report_timer);
+    case HCI_EVENT_LINK_KEY_NOTIFICATION: {
+        bd_addr_t addr;
+        reverse_bd_addr(&packet[2], addr);
+        if (is_console_link_addr(addr)) {
+            ESP_LOGI(TAG, "Bonded with console %s", bd_addr_to_str(addr));
+        }
+        break;
+    }
 
-    gap_connectable_control(1);
-    gap_discoverable_control(0);
+    case HCI_EVENT_ROLE_CHANGE: {
+        bd_addr_t addr;
+        hci_event_role_change_get_bd_addr(packet, addr);
+        if (is_console_link_addr(addr)) {
+            uint8_t status = hci_event_role_change_get_status(packet);
+            uint8_t role = hci_event_role_change_get_role(packet);
+            if (status == ERROR_CODE_SUCCESS) {
+                s_link_master = (role == HCI_ROLE_MASTER);
+                ESP_LOGI(TAG, "Console link: ESP32 is now %s", role == HCI_ROLE_MASTER ? "master" : "slave");
+            } else {
+                ESP_LOGW(TAG, "Console refused role switch (0x%02x); ESP32 stays %s", status,
+                         role == HCI_ROLE_MASTER ? "master" : "slave");
+            }
+        }
+        break;
+    }
 
-    s_hid_ready = true;
-    ESP_LOGI(TAG, "Wiimote BTstack services active (PSM 0x11 & 0x13)");
+    case HCI_EVENT_AUTHENTICATION_COMPLETE_EVENT: {
+        hci_con_handle_t handle = hci_event_authentication_complete_get_connection_handle(packet);
+        uint8_t status = hci_event_authentication_complete_get_status(packet);
+        if (s_link_claimed && handle == s_link_handle && status != ERROR_CODE_SUCCESS) {
+            ESP_LOGW(TAG, "Console authentication failed (0x%02x). Sync again with the red button.", status);
+        }
+        break;
+    }
+
+    case HCI_EVENT_DISCONNECTION_COMPLETE: {
+        hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
+        if (!(s_link_claimed && handle == s_link_handle)) {
+            /* Not the console: say why, it tells radio trouble (0x08 timeout)
+             * from the gamepad hanging up (0x13) or us closing it (0x16). */
+            ESP_LOGI(TAG, "Link 0x%04x (gamepad) disconnected, reason 0x%02x", handle,
+                     hci_event_disconnection_complete_get_reason(packet));
+        }
+        if (s_link_claimed && handle == s_link_handle) {
+            s_last_disconnect_reason = hci_event_disconnection_complete_get_reason(packet);
+            ESP_LOGI(TAG, "Console disconnected (reason 0x%02x)", s_last_disconnect_reason);
+            release_link();
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+    pump_pending_cmds();
 }
 
-static bool s_external_stack = false;
+/* ------------------------------------------------------------ requests -- */
+
+static void sync_start(void)
+{
+    s_sync_active = true;
+    gap_connectable_control(1);
+    gap_discoverable_control(1);
+    scan_activity_fast();
+    s_pending_cmds |= WM_CMD_INQUIRY_SCAN_INTERLACED | WM_CMD_WRITE_IAC_LIAC_GIAC;
+    pump_pending_cmds();
+    ESP_LOGI(TAG, "Sync window open: discoverable as \"%s\". Press the red SYNC button on the console.", k_local_name);
+}
+
+static void sync_end(void)
+{
+    if (s_sync_active) {
+        s_sync_active = false;
+        gap_discoverable_control(0);
+        scan_activity_normal();
+        ESP_LOGI(TAG, "Sync window closed; still connectable");
+    }
+    wiimote_note_sync_ended();
+}
+
+static void stop_all(void)
+{
+    s_sync_active = false;
+    gap_discoverable_control(0);
+    scan_activity_normal();
+    drop_link();
+    if (s_fallback == NULL) {
+        gap_connectable_control(0);
+    }
+    wiimote_note_sync_ended();
+}
+
+static void setup_services(void);
+
+static void run_requests(void *context)
+{
+    uint32_t req;
+    (void)context;
+    taskENTER_CRITICAL(&s_req_mux);
+    req = s_requests;
+    s_requests = 0;
+    taskEXIT_CRITICAL(&s_req_mux);
+
+    if (req & WM_REQ_SETUP) {
+        setup_services();
+    }
+    if (req & WM_REQ_STOP) {
+        stop_all();
+    }
+    if (req & WM_REQ_FORGET) {
+        drop_link();
+        forget_host();
+    }
+    if (req & WM_REQ_DISCONNECT) {
+        drop_link();
+    }
+    if (req & WM_REQ_SYNC) {
+        sync_start();
+    }
+    if (req & WM_REQ_LISTEN) {
+        sync_end();
+    }
+    if (req & WM_REQ_CONNECT) {
+        start_outgoing();
+    }
+    if (req & WM_REQ_FLUSH) {
+        flush_reports();
+    }
+}
+
+static void post_request(uint32_t req)
+{
+    taskENTER_CRITICAL(&s_req_mux);
+    s_requests |= req;
+    taskEXIT_CRITICAL(&s_req_mux);
+    s_req_registration.callback = run_requests;
+    s_req_registration.context = NULL;
+    btstack_run_loop_execute_on_main_thread(&s_req_registration);
+}
+
+/* --------------------------------------------------------------- setup -- */
+
+static void setup_services(void)
+{
+    if (s_setup_done) {
+        return;
+    }
+    s_setup_done = true;
+
+    load_host();
+
+    /* If a host stack registered the HID PSMs already, take them over; we
+     * forward its traffic to the fallback handler. */
+    l2cap_unregister_service(WM_PSM_CONTROL);
+    l2cap_unregister_service(WM_PSM_INTERRUPT);
+    /* Level 0: the console authenticates on its own terms (legacy PIN). */
+    l2cap_register_service(wm_l2cap_handler, WM_PSM_CONTROL, WM_L2CAP_MTU, LEVEL_0);
+    l2cap_register_service(wm_l2cap_handler, WM_PSM_INTERRUPT, WM_L2CAP_MTU, LEVEL_0);
+
+    /* Head of the list: we must see connection and PIN requests first. */
+    s_hci_registration.callback = wm_hci_handler;
+    hci_add_event_handler_for_security_manager(&s_hci_registration);
+
+    gap_register_classic_connection_filter(connection_filter);
+    apply_identity();
+
+    if (hci_get_state() == HCI_STATE_WORKING) {
+        /* Attached late to a running stack: BTSTACK_EVENT_STATE has passed. */
+        on_hci_working();
+    }
+}
+
+#if defined(WIIMOTE_HAVE_ESP32_PORT)
+static void standalone_run_loop_task(void *arg)
+{
+    (void)arg;
+    btstack_run_loop_execute();
+    vTaskDelete(NULL);
+}
+#endif
+
+/* ------------------------------------------------------------ public -- */
+
+void wiimote_btstack_set_fallback_handler(btstack_packet_handler_t handler)
+{
+    s_fallback = handler;
+}
 
 void wiimote_bt_set_external_stack(bool external)
 {
     s_external_stack = external;
 }
 
-#if __has_include("btstack_port_esp32.h") || defined(ESP_PLATFORM)
-static void standalone_btstack_run_task(void *arg)
-{
-    (void)arg;
-    ESP_LOGI(TAG, "BTstack run loop task starting");
-    btstack_run_loop_execute();
-    vTaskDelete(NULL);
-}
-#endif
-
 esp_err_t wiimote_bt_start(void)
 {
-    /* If BTstack is not managed externally and not yet powered on, bring up controller and run loop */
-    if (!s_external_stack && !s_btstack_started && hci_get_state() == HCI_STATE_OFF) {
-#if __has_include("btstack_port_esp32.h")
-        esp_err_t err = nvs_flash_init();
-        if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-            nvs_flash_erase();
-            err = nvs_flash_init();
+    if (!s_external_stack) {
+#if defined(WIIMOTE_HAVE_ESP32_PORT)
+        if (hci_get_state() != HCI_STATE_OFF) {
+            ESP_LOGE(TAG, "BTstack is already running; set external_stack = true");
+            return ESP_ERR_INVALID_STATE;
         }
-        if (err != ESP_OK) return err;
-
+        /* btstack_init() sets up NVS-backed TLV for link keys. */
         if (btstack_init() != ERROR_CODE_SUCCESS) {
             return ESP_FAIL;
         }
         l2cap_init();
         sdp_init();
-        s_btstack_started = true;
-
-        /* Register Wiimote services during startup */
-        register_hid_services_main_thread(NULL);
-
-        hci_power_control(HCI_POWER_ON);
-
-        /* Start BTstack run loop in FreeRTOS task if running standalone */
-        xTaskCreatePinnedToCore(standalone_btstack_run_task, "btstack", 6144, NULL, 5, NULL, 0);
+        setup_services();
+        if (hci_power_control(HCI_POWER_ON) != 0) {
+            return ESP_FAIL;
+        }
+        if (xTaskCreatePinnedToCore(standalone_run_loop_task, "btstack", 8192, NULL, 5, NULL, 0) != pdPASS) {
+            return ESP_ERR_NO_MEM;
+        }
         return ESP_OK;
 #else
+        ESP_LOGE(TAG, "Standalone mode needs BTstack's ESP32 port (btstack_port_esp32.h)");
         return ESP_ERR_NOT_SUPPORTED;
 #endif
     }
 
-    /* BTstack is already managed externally (e.g. by Bluepad32 or app) */
-    s_init_registration.callback = register_hid_services_main_thread;
-    btstack_run_loop_execute_on_main_thread(&s_init_registration);
+    if (on_btstack_thread_or_not_running()) {
+        /* Typical: called after btstack_init() and before the host stack
+         * (uni_init) powers HCI on. l2cap_init / sdp_init are idempotent
+         * enough to be called again by the host stack. */
+        l2cap_init();
+        sdp_init();
+        setup_services();
+    } else {
+        post_request(WM_REQ_SETUP);
+    }
     return ESP_OK;
 }
 
 esp_err_t wiimote_btstack_register_services(void)
 {
-    s_init_registration.callback = register_hid_services_main_thread;
-    btstack_run_loop_execute_on_main_thread(&s_init_registration);
+    if (on_btstack_thread_or_not_running()) {
+        setup_services();
+    } else {
+        post_request(WM_REQ_SETUP);
+    }
     return ESP_OK;
-}
-
-static void sync_main_thread(void *context)
-{
-    (void)context;
-    s_sync_window = true;
-    pause_gamepad_scanning();
-    gap_set_local_name("Nintendo RVL-CNT-01");
-    gap_set_class_of_device(0x002504);
-    gap_set_security_mode(GAP_SECURITY_MODE_2);
-    gap_set_allow_role_switch(true);
-    hci_set_master_slave_policy(HCI_ROLE_SLAVE);
-    gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
-    gap_set_page_scan_activity(0x0200, 0x0024);
-    gap_inquiry_set_scan_activity(0x0200, 0x0024);
-    if (s_have_host_bda) {
-        gap_drop_link_key_for_bd_addr(s_bda);
-    }
-    gap_connectable_control(1);
-    gap_discoverable_control(1);
-
-    /* Queue controller-level LIAC+GIAC registration and interlaced inquiry scan */
-    s_pending_cmds |= WM_CMD_STOP_INQUIRY | WM_CMD_INQ_SCAN_INTERLACED | WM_CMD_WRITE_LIAC;
-    pump_pending_cmds();
-    ESP_LOGI(TAG, "Wiimote sync window active (LIAC 0x9E8B00 + GIAC 0x9E8B33 discoverable + connectable)");
-}
-
-static void listen_main_thread(void *context)
-{
-    (void)context;
-    s_sync_window = false;
-    gap_discoverable_control(0);
-    gap_connectable_control(1);
-    ESP_LOGI(TAG, "Wiimote sync window closed; connectable, non-discoverable");
-}
-
-static void stop_main_thread(void *context)
-{
-    (void)context;
-    s_sync_window = false;
-    gap_discoverable_control(0);
-    gap_connectable_control(0);
-    if (s_cid_interrupt) {
-        l2cap_disconnect(s_cid_interrupt);
-        s_cid_interrupt = 0;
-    }
-    if (s_cid_control) {
-        l2cap_disconnect(s_cid_control);
-        s_cid_control = 0;
-    }
-    wiimote_set_connected(false);
 }
 
 esp_err_t wiimote_bt_sync(void)
 {
-    s_sync_registration.callback = sync_main_thread;
-    btstack_run_loop_execute_on_main_thread(&s_sync_registration);
+    post_request(WM_REQ_SYNC);
     return ESP_OK;
 }
 
 void wiimote_bt_listen_only(void)
 {
-    s_listen_registration.callback = listen_main_thread;
-    btstack_run_loop_execute_on_main_thread(&s_listen_registration);
+    post_request(WM_REQ_LISTEN);
 }
 
 esp_err_t wiimote_bt_stop(void)
 {
-    s_stop_registration.callback = stop_main_thread;
-    btstack_run_loop_execute_on_main_thread(&s_stop_registration);
+    post_request(WM_REQ_STOP);
     return ESP_OK;
+}
+
+esp_err_t wiimote_bt_connect(void)
+{
+    if (!s_have_host) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    post_request(WM_REQ_CONNECT);
+    return ESP_OK;
+}
+
+esp_err_t wiimote_bt_disconnect(void)
+{
+    post_request(WM_REQ_DISCONNECT);
+    return ESP_OK;
+}
+
+esp_err_t wiimote_bt_forget_host(void)
+{
+    post_request(WM_REQ_FORGET);
+    return ESP_OK;
+}
+
+bool wiimote_bt_has_host(void)
+{
+    return s_have_host;
+}
+
+void wiimote_bt_send_now(void)
+{
+    if (s_link_up) {
+        post_request(WM_REQ_FLUSH);
+    }
+}
+
+bool wiimote_bt_link_is_master(void)
+{
+    return s_link_claimed && s_link_master;
+}
+
+uint8_t wiimote_bt_last_disconnect_reason(void)
+{
+    return s_last_disconnect_reason;
 }

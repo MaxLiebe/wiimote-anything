@@ -20,6 +20,26 @@ bool Wiimote::sync()
     return wiimote_sync() == ESP_OK;
 }
 
+bool Wiimote::connect()
+{
+    return wiimote_connect() == ESP_OK;
+}
+
+bool Wiimote::disconnect()
+{
+    return wiimote_disconnect() == ESP_OK;
+}
+
+bool Wiimote::hasPairedHost() const
+{
+    return wiimote_has_paired_host();
+}
+
+bool Wiimote::forgetHost()
+{
+    return wiimote_forget_host() == ESP_OK;
+}
+
 void Wiimote::stop()
 {
     wiimote_stop();

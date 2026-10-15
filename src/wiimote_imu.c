@@ -5,15 +5,89 @@
 
 #include <stddef.h>
 
-#include "driver/i2c.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+
+/* ESP-IDF 5.2+ has the new I2C master driver; the legacy driver/i2c.h is
+ * end-of-life in 6.x and goes away in 7.0. Older cores (Arduino 2.0.x on
+ * IDF 4.4) keep the legacy calls. */
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0)
+#define WIIMOTE_I2C_NG 1
+#include "driver/i2c_master.h"
+#else
+#include "driver/i2c.h"
+#endif
 
 static const char *TAG = "wiimote";
 
 static wiimote_imu_kind_t s_kind = WIIMOTE_IMU_NONE;
 static uint8_t s_addr;
 
+#if defined(WIIMOTE_I2C_NG)
+static i2c_master_bus_handle_t s_bus;
+static i2c_master_dev_handle_t s_dev;
+static uint8_t s_dev_addr;
+
+static esp_err_t select_device(uint8_t addr)
+{
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = addr,
+        .scl_speed_hz = 400000,
+    };
+    if (s_bus == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_dev != NULL && s_dev_addr == addr) {
+        return ESP_OK;
+    }
+    if (s_dev != NULL) {
+        i2c_master_bus_rm_device(s_dev);
+        s_dev = NULL;
+    }
+    esp_err_t err = i2c_master_bus_add_device(s_bus, &cfg, &s_dev);
+    if (err == ESP_OK) {
+        s_dev_addr = addr;
+    }
+    return err;
+}
+
+static esp_err_t i2c_write(uint8_t addr, uint8_t reg, uint8_t value)
+{
+    uint8_t buf[2] = {reg, value};
+    esp_err_t err = select_device(addr);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return i2c_master_transmit(s_dev, buf, sizeof(buf), 50);
+}
+
+static esp_err_t i2c_read(uint8_t addr, uint8_t reg, uint8_t *dst, size_t len)
+{
+    esp_err_t err = select_device(addr);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return i2c_master_transmit_receive(s_dev, &reg, 1, dst, len, 50);
+}
+
+static esp_err_t bus_init(int sda, int scl)
+{
+    i2c_master_bus_config_t cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = sda,
+        .scl_io_num = scl,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    if (s_bus != NULL) {
+        return ESP_OK;
+    }
+    return i2c_new_master_bus(&cfg, &s_bus);
+}
+#else
 static esp_err_t i2c_write(uint8_t addr, uint8_t reg, uint8_t value)
 {
     uint8_t buf[2] = {reg, value};
@@ -45,6 +119,7 @@ static esp_err_t bus_init(int sda, int scl)
     }
     return err;
 }
+#endif
 
 static int16_t le16(const uint8_t *p)
 {

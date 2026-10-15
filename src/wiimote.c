@@ -28,6 +28,7 @@ static uint8_t s_battery = 0xc0;
 static volatile bool s_connected;
 static volatile uint8_t s_leds;
 static volatile bool s_syncing;
+static bool s_sync_reported;
 static int64_t s_sync_deadline_us;
 static int64_t s_blink_us;
 static bool s_blink_lit;
@@ -111,13 +112,13 @@ static void wiimote_task(void *arg)
         int64_t now = esp_timer_get_time();
         wiimote_hw_poll();
         sample_motion();
-        if (s_syncing && !s_connected) {
+        if (s_syncing) {
             if (now >= s_sync_deadline_us) {
                 s_syncing = false;
-                wiimote_bt_listen_only();
                 wiimote_hw_set_leds(s_leds);
-                ESP_LOGE(TAG, "sync window closed; still connectable");
-            } else if (now - s_blink_us >= 250000) {
+                /* The backend closes the window and calls wiimote_note_sync_ended(). */
+                wiimote_bt_listen_only();
+            } else if (!s_connected && now - s_blink_us >= 250000) {
                 s_blink_us = now;
                 s_blink_lit = !s_blink_lit;
                 wiimote_hw_blink(led_count_for_battery(s_battery), s_blink_lit);
@@ -151,12 +152,24 @@ bool wiimote_ready(void)
     return s_proto != NULL;
 }
 
+void wiimote_note_sync_ended(void)
+{
+    s_syncing = false;
+    if (!s_sync_reported) {
+        return;
+    }
+    s_sync_reported = false;
+    if (s_cb.sync_changed) {
+        s_cb.sync_changed(false, s_cb.user);
+    }
+}
+
 void wiimote_set_connected(bool up)
 {
     bool was = s_connected;
     s_connected = up;
-    if (up) {
-        s_syncing = false;
+    if (up && s_syncing) {
+        wiimote_note_sync_ended();
     }
     wiimote_lock();
     if (s_proto != NULL) {
@@ -290,14 +303,75 @@ esp_err_t wiimote_sync(void)
     }
     s_blink_us = esp_timer_get_time();
     s_blink_lit = true;
-    s_sync_deadline_us = s_blink_us + 20000000;
+    s_sync_deadline_us = s_blink_us + WIIMOTE_SYNC_WINDOW_MS * 1000LL;
     s_syncing = true;
     wiimote_hw_blink(led_count_for_battery(s_battery), true);
     err = wiimote_bt_sync();
     if (err != ESP_OK) {
         s_syncing = false;
+        return err;
     }
-    return err;
+    if (!s_sync_reported) {
+        s_sync_reported = true;
+        if (s_cb.sync_changed) {
+            s_cb.sync_changed(true, s_cb.user);
+        }
+    }
+    return ESP_OK;
+}
+
+bool wiimote_is_syncing(void)
+{
+    return s_syncing;
+}
+
+esp_err_t wiimote_connect(void)
+{
+    if (s_proto == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_connected) {
+        return ESP_OK;
+    }
+    return wiimote_bt_connect();
+}
+
+esp_err_t wiimote_disconnect(void)
+{
+    if (s_proto == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return wiimote_bt_disconnect();
+}
+
+bool wiimote_has_paired_host(void)
+{
+    return s_proto != NULL && wiimote_bt_has_host();
+}
+
+void wiimote_send_now(void)
+{
+    if (s_proto != NULL) {
+        wiimote_bt_send_now();
+    }
+}
+
+bool wiimote_link_is_master(void)
+{
+    return s_proto != NULL && wiimote_bt_link_is_master();
+}
+
+uint8_t wiimote_last_disconnect_reason(void)
+{
+    return s_proto != NULL ? wiimote_bt_last_disconnect_reason() : 0;
+}
+
+esp_err_t wiimote_forget_host(void)
+{
+    if (s_proto == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return wiimote_bt_forget_host();
 }
 
 esp_err_t wiimote_stop(void)
@@ -308,6 +382,7 @@ esp_err_t wiimote_stop(void)
     s_syncing = false;
     wiimote_hw_set_leds(0);
     wiimote_hw_set_rumble(false);
+    /* The backend reports the end of any open sync window. */
     return wiimote_bt_stop();
 }
 

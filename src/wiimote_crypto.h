@@ -19,13 +19,14 @@ typedef struct {
 void wiimote_crypto_load_constant(wiimote_crypto_t *crypto, uint8_t pad);
 
 /**
- * Load a 16-byte extension key (10 random bytes, then 6 secret bytes).
+ * Load the 16 bytes the console wrote to extension registers 0x40..0x4f
+ * (10 random bytes, then 6 secret bytes, each half in reverse byte order).
  * Returns the matching table index 0..6, or -1 when the secret does not
  * match and the constant 0x97 pads are used instead.
  */
 int wiimote_crypto_load_key(wiimote_crypto_t *crypto, const uint8_t key[16]);
 
-/** Write the secret half of key[10..15] for a chosen table index. key[0..9] is the random half. */
+/** Fill registers 10..15 with the secret matching key[0..9] for a table index (register layout). */
 void wiimote_crypto_fill_secret(uint8_t key[16], int index);
 
 uint8_t wiimote_crypto_encrypt_byte(const wiimote_crypto_t *crypto, uint8_t plain, uint8_t addr);

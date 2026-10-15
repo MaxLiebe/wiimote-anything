@@ -9,15 +9,28 @@
 #error "WiimoteAnything needs the original ESP32 (the chip with Bluetooth Classic). ESP32-S3, C3, C6, and H2 cannot host a Wiimote."
 #endif
 
+/*
+ * Backend selection. Define WIIMOTE_BACKEND_BTSTACK or WIIMOTE_BACKEND_BLUEDROID
+ * to force one. Otherwise BTstack is used whenever its headers are visible
+ * (Bluepad32, BTstack's ESP32 port), and Bluedroid otherwise (stock Arduino).
+ */
 #if !defined(WIIMOTE_BACKEND_BTSTACK) && !defined(WIIMOTE_BACKEND_BLUEDROID)
-#if defined(CONFIG_BTSTACK_INTERNAL_BT) || (defined(__has_include) && __has_include("btstack.h"))
+#if defined(__has_include)
+#if __has_include("btstack.h")
 #define WIIMOTE_BACKEND_BTSTACK 1
+#endif
+#endif
+#if !defined(WIIMOTE_BACKEND_BTSTACK)
+#define WIIMOTE_BACKEND_BLUEDROID 1
 #endif
 #endif
 
 #if defined(WIIMOTE_BACKEND_BTSTACK)
 #if !defined(CONFIG_BT_ENABLED)
-#error "Enable Bluetooth controller (CONFIG_BT_ENABLED) for BTstack."
+#error "Enable the Bluetooth controller (CONFIG_BT_ENABLED=y, CONFIG_BT_CONTROLLER_ONLY=y) for BTstack."
+#endif
+#if defined(CONFIG_BTSTACK_INTERNAL_BT) && !defined(CONFIG_BTDM_CTRL_MODE_BTDM)
+#error "BTstack's ESP32 port only builds its Bluetooth Classic sources with CONFIG_BTDM_CTRL_MODE_BTDM=y (dual mode). Set it, even if you do not use BLE."
 #endif
 #else
 #if !defined(CONFIG_BT_CLASSIC_ENABLED) || !defined(CONFIG_BT_BLUEDROID_ENABLED)

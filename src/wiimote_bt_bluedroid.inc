@@ -1644,16 +1644,53 @@ void wiimote_bt_listen_only(void)
 {
     s_sync_window = 0;
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    wiimote_note_sync_ended();
 }
 
 esp_err_t wiimote_bt_stop(void)
 {
     s_sync_window = 0;
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    wiimote_note_sync_ended();
     if (!post_btu(stop_cb)) {
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+/* Reconnect-by-paging is implemented in the BTstack backend only. */
+esp_err_t wiimote_bt_connect(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t wiimote_bt_disconnect(void)
+{
+    return wiimote_bt_stop();
+}
+
+esp_err_t wiimote_bt_forget_host(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+bool wiimote_bt_has_host(void)
+{
+    return false;
+}
+
+void wiimote_bt_send_now(void)
+{
+}
+
+bool wiimote_bt_link_is_master(void)
+{
+    return false;
+}
+
+uint8_t wiimote_bt_last_disconnect_reason(void)
+{
+    return 0;
 }
 
 void wiimote_bt_set_external_stack(bool external)

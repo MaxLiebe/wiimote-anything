@@ -1,18 +1,16 @@
 # Standalone BTstack Wiimote
 
-Runs WiimoteAnything as a Bluetooth Classic HID peripheral on an ESP32 using BTstack directly (without Bluepad32 or Arduino).
+WiimoteAnything starts and owns BTstack (no Bluepad32). Buttons on GPIO 4 (A)
+and 5 (B) to GND, LED on GPIO 26, rumble on GPIO 25.
 
-## Features
-
-- Uses BlueKitchen BTstack for L2CAP and SDP services.
-- Emulates Nintendo RVL-CNT-01 Wiimote.
-- Low RAM usage (~35 KB RAM vs ~150 KB with Bluedroid).
-- Clean legacy PIN pairing with the Wii console.
-
-## Building with ESP-IDF
+BTstack is taken from Bluepad32's checkout if `components/bluepad32` exists
+next to the library, from `components/btstack`, or from `$BTSTACK_ROOT`.
 
 ```bash
 idf.py set-target esp32
-idf.py build
-idf.py flash monitor
+idf.py build flash monitor
 ```
+
+First boot: the sync window opens; press the red SYNC button on the Wii.
+Later boots: press A and the ESP32 pages the Wii, the way a bonded remote
+does. Press BOOT to sync again.

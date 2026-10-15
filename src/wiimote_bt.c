@@ -1,18 +1,15 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Bluetooth Classic transport selection.
+ * Bluetooth Classic transport selection (see wiimote_target.h).
  *
- * BTstack is the primary, lightweight backend designed for direct integration
- * with Bluepad32, ESP-IDF, and modern Bluetooth projects.
- *
- * If compiling in a stock Arduino-ESP32 environment without BTstack installed,
- * or when WIIMOTE_BACKEND_BLUEDROID is explicitly defined, the library falls back
- * to the Bluedroid backend.
+ * BTstack is the primary backend (standalone, or shared with Bluepad32).
+ * Bluedroid is the fallback for stock Arduino-ESP32 / ESP-IDF builds.
  */
+#include "wiimote_target.h"
 #include "wiimote_bt.h"
 
-#if defined(WIIMOTE_BACKEND_BLUEDROID) || (!defined(WIIMOTE_BACKEND_BTSTACK) && !__has_include("btstack.h"))
-#include "wiimote_bt_bluedroid.inc"
-#else
+#if defined(WIIMOTE_BACKEND_BTSTACK)
 #include "wiimote_bt_btstack.inc"
+#else
+#include "wiimote_bt_bluedroid.inc"
 #endif

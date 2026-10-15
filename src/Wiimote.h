@@ -8,6 +8,10 @@ class Wiimote {
 public:
     bool begin(const wiimote_config_t *config);
     bool sync();
+    bool connect();
+    bool disconnect();
+    bool hasPairedHost() const;
+    bool forgetHost();
     void stop();
     bool registerBtstackServices();
 

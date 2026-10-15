@@ -4,9 +4,12 @@ The ESP32 is the Wiimote. A real Wii is the host.
 
 This library speaks Bluetooth Classic HID the way a Nintendo RVL-CNT-01 does: device name `Nintendo RVL-CNT-01`, class of device `0x002504`, L2CAP PSM `0x11` (control) and `0x13` (interrupt), report headers `0xA2` / `0xA1`, and the extension bus games actually initialize. Pairing during sync uses the Wii's BD_ADDR reversed as the PIN. There is no Wi-Fi and no cloud.
 
-The library features dual Bluetooth backends:
-1. **BTstack Backend (Primary / Recommended):** Lightweight, standards-compliant, and built to seamlessly combine with **[Bluepad32](https://github.com/ricardoquesada/bluepad32)** to create a controller-to-Wiimote adapter on a single ESP32. Does not suffer from Bluedroid's 8-attribute SDP limitation.
-2. **Bluedroid Backend (Fallback):** Provides zero-setup plug-and-play compatibility for stock Arduino-ESP32 installations where BTstack is not installed.
+Two Bluetooth backends:
+
+1. **BTstack (primary).** Standalone, or sharing one BTstack instance with **[Bluepad32](https://github.com/ricardoquesada/bluepad32)** so a single ESP32 is a gamepad host and a Wii Remote at the same time. Remembers the Wii it synced with and reconnects by paging it, the way a bonded remote does.
+2. **Bluedroid (fallback).** For stock Arduino-ESP32 / ESP-IDF builds without BTstack. Sync only (no reconnect-by-paging).
+
+The backend is chosen at compile time: BTstack when `btstack.h` is on the include path, Bluedroid otherwise. Define `WIIMOTE_BACKEND_BTSTACK` or `WIIMOTE_BACKEND_BLUEDROID` to force one.
 
 The stack is C and uses ESP-IDF / BTstack APIs. `src/Wiimote.h` is a thin C++ wrapper for Arduino sketches. It does not pull Arduino types into the protocol code.
 
@@ -18,28 +21,42 @@ ESP32-S3, C3, C6, and H2 do not have a BR/EDR radio. They cannot host this libra
 
 Targeted host SDKs:
 
-- **Bluepad32 / BTstack (ESP-IDF 4.4 & 5.x):** The premier setup for controller-to-Wiimote adapters. Both Bluepad32 (HID Host) and WiimoteAnything (HID Device) run concurrently on the same BTstack engine on a single ESP32!
-- **ESP-IDF with BTstack component:** Dedicated standalone BTstack builds (`examples/BTstackStandalone`).
-- **Arduino-ESP32 2.0.17 and 3.x:** Board **ESP32 Dev Module**. Automatically uses the Bluedroid fallback if BTstack is not present, or BTstack if available.
-- **ESP-IDF with Bluedroid Classic enabled:** On IDF 5 enable `CONFIG_BT_L2CAP_ENABLED` and `CONFIG_BT_SDP_COMMON_ENABLED`.
+- **ESP-IDF 5.x / 6.x + Bluepad32 (BTstack):** the controller-to-Wii adapter, [`examples/Bluepad32_Wiimote_Adapter`](examples/Bluepad32_Wiimote_Adapter). Builds with ESP-IDF 6.1 and Bluepad32 5.0.0-beta0.
+- **ESP-IDF + BTstack's ESP32 port, standalone:** [`examples/BTstackStandalone`](examples/BTstackStandalone).
+- **Arduino-ESP32 2.0.17 and 3.x:** board **ESP32 Dev Module**, Bluedroid backend.
+- **ESP-IDF with Bluedroid Classic enabled:** [`examples/idf`](examples/idf). On IDF 5+ enable `CONFIG_BT_L2CAP_ENABLED` and `CONFIG_BT_SDP_COMMON_ENABLED`.
 
-## Bluepad32 Controller Adapter
+## Bluepad32 controller adapter
 
-Combining WiimoteAnything with Bluepad32 allows you to connect modern wireless gamepads (DualSense, DualShock 4, Xbox Wireless, Switch Pro, 8BitDo) to the ESP32 via Bluetooth and output them to a Nintendo Wii as a Wiimote + Classic Controller in real time:
+Connect a modern gamepad (DualSense, DualShock 4, Switch Pro, 8BitDo, Xbox, ...) to the ESP32 and it shows up on a real Wii as a Wii Remote with a Classic Controller. See [`examples/Bluepad32_Wiimote_Adapter`](examples/Bluepad32_Wiimote_Adapter).
 
-See [`examples/Bluepad32_Wiimote_Adapter`](examples/Bluepad32_Wiimote_Adapter) for the complete implementation!
+Both stacks share BTstack. The Wii (host to us) and a reconnecting gamepad (device to us) both open L2CAP PSM `0x11`/`0x13`, so WiimoteAnything owns those PSMs and forwards every channel that is not the console to Bluepad32. A connection is the console when its class of device is not "peripheral" (the Wii is `0x000448`) or when it comes from the console synced before. WiimoteAnything also hides the console's connection request and PIN request from Bluepad32, so Bluepad32 does not allocate a gamepad slot for the Wii (and later time it out) or answer the PIN with the wrong code. It never starts or stops gamepad scanning; that is the application's job.
 
 ```c
-// Bluepad32 manages BTstack; WiimoteAnything attaches to it:
+#include "wiimote.h"
+#include "wiimote_btstack.h"
+
+btstack_init();
+wiimote_btstack_set_fallback_handler(uni_bt_packet_handler);  // non-Wii traffic -> Bluepad32
 wiimote_config_t cfg = {
     .extension = WIIMOTE_EXT_CLASSIC,
-    .battery = 0xC0,
     .callbacks = &callbacks,
-    .external_stack = true,
+    .external_stack = true,          // the app owns BTstack
 };
-wiimote_init(&cfg);
-wiimote_sync();
+wiimote_init(&cfg);                  // before uni_init(): we must see the Wii first
+uni_platform_set_custom(&platform);
+uni_init(0, NULL);
+btstack_run_loop_execute();
 ```
+
+With the BTstack backend all callbacks run on the BTstack thread, so they may call BTstack and Bluepad32 `_unsafe` functions directly.
+
+## Sync, reconnect, forget
+
+- `wiimote_sync()` is the red SYNC button on the back of a remote: discoverable for 20 s. Press SYNC on the Wii. The console that pairs is stored (BTstack TLV / NVS) together with its link key.
+- `wiimote_connect()` is pressing a button on a bonded remote: page the stored console and open the HID channels. Works after a reboot without syncing again. `ESP_ERR_NOT_FOUND` if nothing was synced.
+- `wiimote_has_paired_host()`, `wiimote_forget_host()`, `wiimote_disconnect()`, `wiimote_is_syncing()`.
+- `callbacks.sync_changed(active)` reports the sync window opening and closing.
 
 ## What a Wii will accept
 
@@ -50,7 +67,7 @@ Implemented from the public Wiibrew Wiimote, extension, and MotionPlus notes:
 - Player LEDs, the rumble bit on every output report, and battery level (low-battery flag below `0x20`).
 - Data modes `0x30`–`0x37`, `0x3d`, and interleaved `0x3e`/`0x3f`. Core reports run at 100 Hz after the Wii sends `0x12`. `0x3e`/`0x3f` alternate, so a full IR sample is 50 Hz. Unsolicited extension-change status stops reports until the next `0x12`.
 - EEPROM image with the published IR block and an accelerometer calibration (0 g = `0x200`, +1 g = `0x26A`) whose checksum matches what we transmit. Idle pose is face-up: X = Y = `0x200`, Z = `0x26A`.
-- Extension init `0x55` at `0xF0`, `0x00` at `0xFB`, I2C address `0x52`, and the extension cipher (constant `0x97` pads, or the 16-byte key at `0x40`). Identifier bytes `0xFA`–`0xFF` stay plaintext.
+- Extension init: unencrypted (`0x55` at `0xF0`, `0x00` at `0xFB`) or encrypted (`0xAA` at `0xF0` plus the 16-byte key the console writes to `0x40`–`0x4F`, in either order, as retail software does). While `0xF0` holds `0xAA` every extension register read is encrypted, including the identifier at `0xFA`. The key schedule matches Dolphin's (`tests/test_proto.c` has a Dolphin-generated vector). I2C address `0x52`.
 - Extensions, changed at runtime with `wiimote_set_extension`:
   - None
   - Nunchuk (`00 00 A4 20 00 00`)
@@ -88,6 +105,8 @@ arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32 examples/BasicButton
 
 Open the serial monitor at 115200. Reset the ESP32, then while it is inside the 20 second window press the red SYNC button on the Wii console face (not just power). The Wii's player LEDs blink while it searches. The ESP32 should log an inbound ACL and a PIN request, not an inquiry result for the console. The sketch prints `connected` after both HID channels are up.
 
+If you use the Bluepad32 Arduino core (which ships BTstack), the BTstack backend is selected: set `external_stack = true`, because that core already runs BTstack.
+
 On Arduino-ESP32 3.x the wrapper includes `esp32-hal-alloc-bt-classic-mem.h` when that header exists, so the core keeps Classic controller memory.
 
 `esp_bluedroid_init_with_cfg()` is used only when the header defines `BT_BLUEDROID_INIT_CONFIG_DEFAULT`. Arduino-ESP32 2.0.17 and 3.0.7 (IDF 5.1.4) do not have `esp_bluedroid_config_t`; those cores call `esp_bluedroid_init()`.
@@ -114,19 +133,19 @@ idf.py build
 
 That project builds with ESP-IDF 5.x for the original ESP32.
 
-### BTstack / Bluepad32 Configuration (sdkconfig.defaults):
+### BTstack / Bluepad32 configuration (sdkconfig.defaults)
+
+BTstack is the host, so the IDF provides only the controller. BTstack's ESP32 port compiles its Classic sources only in dual mode, so use BTDM even if you never touch BLE (`wiimote_target.h` stops the build otherwise):
 
 ```
 CONFIG_BT_ENABLED=y
-CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
-CONFIG_BT_BLUEDROID_ENABLED=n
-CONFIG_BT_NIMBLE_ENABLED=n
 CONFIG_BT_CONTROLLER_ONLY=y
+CONFIG_BTDM_CTRL_MODE_BTDM=y
+CONFIG_BTDM_CTRL_MODEM_SLEEP=n
+CONFIG_FREERTOS_HZ=1000
 ```
 
-### Bluedroid Fallback Configuration:
-
-If using the legacy Bluedroid backend on ESP-IDF 5 instead:
+### Bluedroid fallback configuration
 
 ```
 CONFIG_BT_ENABLED=y
@@ -208,10 +227,12 @@ One IMU feeds the Wiimote body. Mapped sensor X/Y/Z are copied onto the Wiimote 
 Protocol, extension, and cipher code does not include ESP-IDF headers.
 
 ```bash
-make -C tests
+make -C tests            # BTSTACK_ROOT=... if Bluepad32 is not in components/bluepad32
 ```
 
-That covers button and accel packing, nunchuk and classic bytes, extension init, a missing-extension error, MotionPlus activate and passthrough alternation, the extension cipher, EEPROM calibration, status, rumble, LEDs, and a basic IR dot.
+`test_proto` covers button and accel packing, nunchuk and classic bytes (decoded the way Linux `hid-wiimote` decodes them), extension init, a missing-extension error, MotionPlus activate and passthrough alternation, the extension cipher, EEPROM calibration, status, rumble, LEDs, and a basic IR dot.
+
+`test_btstack_backend` runs the BTstack backend against fake BTstack calls: a Wii syncing (PIN, events hidden from the host stack, channels, status / read / write / report mode replies, SET_REPORT handshake), a gamepad reconnecting while the Wii is connected (forwarded untouched), reconnecting by paging, a page that times out, and forgetting the console.
 
 ## License
 
