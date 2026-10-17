@@ -35,25 +35,44 @@ static void put_be16(uint8_t *p, uint16_t value)
     p[1] = (uint8_t)value;
 }
 
-static void seal_sum(uint8_t *block, size_t len)
+static void seal_ext_cal(uint8_t *block)
 {
     size_t i;
     unsigned sum = 0x55;
-    for (i = 0; i + 1 < len; i++) {
+    for (i = 0; i < 14; i++) {
         sum += block[i];
     }
-    block[len - 1] = (uint8_t)sum;
+    block[14] = (uint8_t)sum;
+    block[15] = (uint8_t)(sum + 0x55);
 }
 
 static void write_nunchuk_cal(uint8_t *reg)
 {
     /* 0 g at 512, +1 g at 0x26A, stick max/min/center. Duplicate lives at 0x30. */
-    static const uint8_t body[] = {
+    static const uint8_t body[14] = {
         0x80, 0x80, 0x80, 0x00, 0x9a, 0x9a, 0x9a, 0x2a,
-        0xe0, 0x1e, 0x80, 0xe0, 0x1e, 0x80, 0x00
+        0xe0, 0x1e, 0x80, 0xe0, 0x1e, 0x80
     };
     memcpy(reg + 0x20, body, sizeof(body));
-    seal_sum(reg + 0x20, 16);
+    seal_ext_cal(reg + 0x20);
+    memcpy(reg + 0x30, reg + 0x20, 16);
+}
+
+static void write_classic_cal(uint8_t *reg)
+{
+    /* Stick max / min / center in 8-bit scale (6-bit LX/LY << 2, 5-bit RX/RY << 3),
+     * trigger rest values, then the 2-byte checksum (sum+0x55, sum+0xaa).
+     * The full 0x00..0xff span matches what wiimote_set_axis() produces
+     * (0..63 / 0..31), so games scale a full deflection to full scale. */
+    static const uint8_t body[14] = {
+        0xff, 0x00, 0x80, /* Left Stick X: max, min, center */
+        0xff, 0x00, 0x80, /* Left Stick Y: max, min, center */
+        0xff, 0x00, 0x80, /* Right Stick X: max, min, center */
+        0xff, 0x00, 0x80, /* Right Stick Y: max, min, center */
+        0x00, 0x00        /* Left/Right Trigger rest */
+    };
+    memcpy(reg + 0x20, body, sizeof(body));
+    seal_ext_cal(reg + 0x20);
     memcpy(reg + 0x30, reg + 0x20, 16);
 }
 
@@ -85,6 +104,22 @@ static void clear_crypto(wiimote_ext_t *ext)
 {
     memset(&ext->crypto, 0, sizeof(ext->crypto));
     ext->crypto_armed = false;
+    ext->crypto_dirty = false;
+}
+
+/* Like a real extension (and Dolphin): reads are encrypted while register
+ * 0xF0 holds 0xAA, with pads derived from whatever is in 0x40..0x4F at that
+ * moment. The console may write the key and 0xAA in either order. */
+static void refresh_crypto(wiimote_ext_t *ext)
+{
+    if (!ext->crypto_armed) {
+        ext->crypto.active = false;
+        return;
+    }
+    if (ext->crypto_dirty || !ext->crypto.active) {
+        wiimote_crypto_load_key(&ext->crypto, ext->a4 + 0x40);
+        ext->crypto_dirty = false;
+    }
 }
 
 static bool nunchuk_plugged(const wiimote_ext_t *ext)
@@ -116,7 +151,7 @@ static void apply_visibility(wiimote_ext_t *ext)
         ext->a4_visible = true;
         memcpy(ext->a4 + 0xfa,
                ext->type == WIIMOTE_EXT_CLASSIC_PRO ? k_id_classic_pro : k_id_classic, 6);
-        write_nunchuk_cal(ext->a4);
+        write_classic_cal(ext->a4);
         return;
     }
     ext->a4_visible = false;
@@ -193,13 +228,9 @@ static void deactivate_mp(wiimote_ext_t *ext, wiimote_ext_result_t *result)
 static void maybe_finish_key(wiimote_ext_t *ext, uint32_t addr, size_t len)
 {
     uint32_t end = addr + (uint32_t)len - 1;
-    if (!ext->crypto_armed) {
-        return;
+    if (addr <= 0x4f && end >= 0x40) {
+        ext->crypto_dirty = true;
     }
-    if (addr > 0x4f || end < 0x40 || end < 0x4f) {
-        return;
-    }
-    wiimote_crypto_load_key(&ext->crypto, ext->a4 + 0x40);
 }
 
 static void on_a4_byte(wiimote_ext_t *ext, uint32_t addr, uint8_t value, size_t write_len,
@@ -209,14 +240,14 @@ static void on_a4_byte(wiimote_ext_t *ext, uint32_t addr, uint8_t value, size_t 
         deactivate_mp(ext, result);
         return;
     }
-    if (addr == 0xf0 && value == 0x55) {
-        clear_crypto(ext);
-    } else if (addr == 0xf0 && value == 0xaa) {
-        ext->crypto_armed = true;
-    } else if (addr == 0xfb && value == 0x00) {
-        clear_crypto(ext);
-    } else if (addr == 0x40 && write_len == 1 && value == 0x00 && !ext->crypto_armed) {
-        wiimote_crypto_load_constant(&ext->crypto, 0x97);
+    (void)write_len;
+    if (addr == 0xf0) {
+        if (value == 0xaa) {
+            ext->crypto_armed = true;
+            ext->crypto_dirty = true;
+        } else {
+            clear_crypto(ext); /* 0x55 (the "new way" init) and anything else */
+        }
     }
 }
 
@@ -266,6 +297,9 @@ int wiimote_ext_read(wiimote_ext_t *ext, uint32_t addr, uint8_t *dst, size_t len
         *error = 7;
         return -1;
     }
+    if (space == 0) {
+        refresh_crypto(ext);
+    }
     if (space == 0 && !ext->mp_active) {
         uint8_t saved = ext->mp_phase;
         refresh_plaintext(ext);
@@ -274,7 +308,7 @@ int wiimote_ext_read(wiimote_ext_t *ext, uint32_t addr, uint8_t *dst, size_t len
     for (i = 0; i < len; i++) {
         uint8_t b = base[off + i];
         uint32_t at = off + (uint32_t)i;
-        if (space == 0 && ext->crypto.active && at < 0xfa) {
+        if (space == 0 && ext->crypto.active) {
             b = wiimote_crypto_encrypt_byte(&ext->crypto, b, (uint8_t)at);
         }
         dst[i] = b;
@@ -372,10 +406,15 @@ static void pack_classic(const wiimote_ext_t *ext, uint8_t out[6])
     uint8_t ry = ext->classic_ry & 0x1f;
     uint8_t lt = ext->classic_lt & 0x1f;
     uint8_t rt = ext->classic_rt & 0x1f;
-    out[0] = (uint8_t)((lx << 2) | ((rx >> 3) & 0x03));
-    out[1] = (uint8_t)((ly << 2) | ((rx >> 1) & 0x03));
-    out[2] = (uint8_t)((ry << 3) | (((lt >> 3) & 0x03) << 1) | (rx & 0x01));
-    out[3] = (uint8_t)((rt << 3) | (lt & 0x07));
+    /* Data format 1 (wiibrew "Classic Controller", Linux hid-wiimote, Dolphin):
+     *   0: RX<4:3> LX<5:0>
+     *   1: RX<2:1> LY<5:0>
+     *   2: RX<0>   LT<4:3> RY<4:0>
+     *   3: LT<2:0> RT<4:0>                                                  */
+    out[0] = (uint8_t)((((rx >> 3) & 0x03) << 6) | lx);
+    out[1] = (uint8_t)((((rx >> 1) & 0x03) << 6) | ly);
+    out[2] = (uint8_t)(((rx & 0x01) << 7) | (((lt >> 3) & 0x03) << 5) | ry);
+    out[3] = (uint8_t)(((lt & 0x07) << 5) | rt);
     out[4] = 0xff;
     out[5] = 0xff;
     if (classic_down(ext, WIIMOTE_BUTTON_CLASSIC_RIGHT)) out[4] &= (uint8_t)~0x80;
@@ -461,10 +500,11 @@ void wiimote_ext_stream(wiimote_ext_t *ext, uint8_t *dst, size_t len)
 {
     size_t i;
     refresh_plaintext(ext);
+    refresh_crypto(ext);
     for (i = 0; i < len; i++) {
         uint8_t at = (uint8_t)(i & 0xff);
         uint8_t b = ext->a4[at];
-        if (ext->crypto.active && !ext->mp_active && at < 0xfa) {
+        if (ext->crypto.active && !ext->mp_active) {
             b = wiimote_crypto_encrypt_byte(&ext->crypto, b, at);
         }
         dst[i] = b;

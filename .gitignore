@@ -6,3 +6,6 @@ managed_components/
 tests/test_proto
 .cache/
 agent-tools/
+components/
+dependencies.lock
+tests/test_btstack_backend

@@ -48,14 +48,35 @@ static void secret_for_index(const uint8_t random10[10], int index, uint8_t secr
     secret[5] = (uint8_t)((rot_right((uint8_t)(k_answer[index][5] ^ mixed[7]), mixed[8]) - mixed[5]) ^ mixed[9]);
 }
 
+/* The console writes the key to registers 0x40..0x4f. The random half is
+ * 0x40..0x49 and the secret half 0x4a..0x4f, each stored in reverse byte
+ * order (Dolphin's KeyGen::GenerateFromExtensionKeyData does the same). */
+static void split_key(const uint8_t regs[16], uint8_t random10[10], uint8_t secret[6])
+{
+    int i;
+    for (i = 0; i < 10; i++) {
+        random10[i] = regs[9 - i];
+    }
+    for (i = 0; i < 6; i++) {
+        secret[i] = regs[15 - i];
+    }
+}
+
 void wiimote_crypto_fill_secret(uint8_t key[16], int index)
 {
+    uint8_t random10[10];
     uint8_t secret[6];
+    int i;
     if (index < 0 || index > 6) {
         return;
     }
-    secret_for_index(key, index, secret);
-    memcpy(key + 10, secret, 6);
+    for (i = 0; i < 10; i++) {
+        random10[i] = key[9 - i];
+    }
+    secret_for_index(random10, index, secret);
+    for (i = 0; i < 6; i++) {
+        key[15 - i] = secret[i];
+    }
 }
 
 static int matching_index(const uint8_t random10[10], const uint8_t secret[6])
@@ -102,12 +123,17 @@ void wiimote_crypto_load_constant(wiimote_crypto_t *crypto, uint8_t pad)
 
 int wiimote_crypto_load_key(wiimote_crypto_t *crypto, const uint8_t key[16])
 {
-    int index = matching_index(key, key + 10);
+    uint8_t random10[10];
+    uint8_t secret[6];
+    int index;
+    split_key(key, random10, secret);
+    index = matching_index(random10, secret);
     if (index < 0) {
+        /* Retail software always matches; some homebrew writes zeros. */
         wiimote_crypto_load_constant(crypto, 0x97);
         return -1;
     }
-    pads_from_tables(crypto->ft, crypto->sb, key, key + 10, k_sboxes[index], k_sboxes[index + 1]);
+    pads_from_tables(crypto->ft, crypto->sb, random10, secret, k_sboxes[index], k_sboxes[index + 1]);
     crypto->active = true;
     return index;
 }

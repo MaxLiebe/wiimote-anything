@@ -1,0 +1,3 @@
+#pragma once
+#define CONFIG_IDF_TARGET_ESP32 1
+#define CONFIG_BT_ENABLED 1

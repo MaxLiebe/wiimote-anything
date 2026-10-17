@@ -24,7 +24,8 @@ typedef struct {
     bool mp_passthrough;
     bool a4_visible;
     wiimote_crypto_t crypto;
-    bool crypto_armed;
+    bool crypto_armed; /* register 0xF0 == 0xAA */
+    bool crypto_dirty; /* key registers changed since the pads were derived */
     uint8_t nunchuk_x;
     uint8_t nunchuk_y;
     uint16_t nunchuk_ax;
